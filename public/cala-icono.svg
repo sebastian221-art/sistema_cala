@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" fill="none" role="img" aria-label="CALA ASOCIADOS">
+  <!-- Círculo base gris (como la C del logo) -->
+  <circle cx="22" cy="22" r="20" stroke="#8C8C8C" stroke-width="4" fill="none"/>
+  <!-- Arco verde (como la C del logo) -->
+  <path d="M38 14 A18 18 0 1 0 38 30" stroke="#39B549" stroke-width="4.5" fill="none" stroke-linecap="round"/>
+  <!-- Letra A amarilla centrada -->
+  <text x="22" y="28" font-family="Arial Black, Arial, sans-serif" font-size="16" font-weight="900"
+        fill="#F4D03F" text-anchor="middle" dominant-baseline="auto">A</text>
+</svg>

@@ -1,0 +1,218 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Variables de marca CALA ASOCIADOS ─────────────────────────────────────
+   Verde corporativo: #39B549  →  RGB 57 181 73
+   Amarillo logo:     #F4D03F  →  RGB 244 208 63
+   Gris metálico:     #8C8C8C  →  RGB 140 140 140
+   ─────────────────────────────────────────────────────────────────────────── */
+
+@layer base {
+  /* ══════════════════════════════════════════
+     MODO CLARO — fondo blanco, acento verde
+     ══════════════════════════════════════════ */
+  :root {
+    --primary:            57 181 73;      /* #39B549 — verde logo CALA */
+    --primary-foreground: 255 255 255;
+    --primary-light:      80 205 97;      /* #50CD61 */
+    --primary-dark:       38 138 52;      /* #268A34 */
+
+    --accent:             244 208 63;     /* #F4D03F — amarillo logo */
+    --accent-foreground:  18 38 22;
+
+    --background:         250 253 250;
+    --foreground:         15 20 16;
+    --card:               255 255 255;
+    --card-foreground:    15 20 16;
+    --popover:            255 255 255;
+    --popover-foreground: 15 20 16;
+
+    --border:             210 238 215;
+    --input:              210 238 215;
+    --ring:               57 181 73;
+
+    --muted:              240 250 242;
+    --muted-foreground:   88 120 95;
+
+    --success:            57 181 73;
+    --warning:            244 162 63;
+    --danger:             220 53 69;
+
+    /* Sidebar — verde corporativo oscuro */
+    --sidebar:            33 108 46;      /* #216C2E */
+    --sidebar-foreground: 248 253 249;
+    --sidebar-border:     46 138 62;      /* #2E8A3E */
+    --sidebar-accent:     46 138 62;
+
+    --radius: 0.75rem;
+  }
+
+  /* ══════════════════════════════════════════
+     MODO OSCURO — negro neutro, acento verde brillante
+     Negro real, no verde-negro.
+     El verde solo aparece en elementos interactivos.
+     ══════════════════════════════════════════ */
+  .dark {
+    --primary:            76 200 92;      /* #4CC85C — verde brillante sobre negro */
+    --primary-foreground: 8 12 9;
+
+    --accent:             220 185 42;     /* #DCB92A — amarillo sobre oscuro */
+    --accent-foreground:  240 245 240;
+
+    /* Fondo y tarjetas: negro neutro, sin tinte verde */
+    --background:         13 13 13;       /* #0D0D0D — casi negro neutro */
+    --foreground:         240 240 240;    /* blanco suave */
+    --card:               22 22 22;       /* #161616 */
+    --card-foreground:    240 240 240;
+    --popover:            22 22 22;
+    --popover-foreground: 240 240 240;
+
+    --border:             40 40 40;       /* #282828 — borde gris oscuro */
+    --input:              40 40 40;
+    --ring:               76 200 92;
+
+    --muted:              28 28 28;       /* #1C1C1C */
+    --muted-foreground:   155 155 155;    /* gris medio, buen contraste */
+
+    --success:            76 200 92;
+    --warning:            244 162 63;
+    --danger:             240 75 90;
+
+    /* Sidebar dark: negro profundo con borde verde sutil */
+    --sidebar:            8 8 8;          /* #080808 */
+    --sidebar-foreground: 230 230 230;
+    --sidebar-border:     30 42 32;       /* borde con toque verde muy sutil */
+    --sidebar-accent:     28 40 30;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'DM Sans', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3 {
+    font-family: 'Playfair Display', Georgia, serif;
+  }
+
+  .font-mono,
+  .tabular-nums {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-muted;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full;
+  }
+}
+
+/* ─── Componentes personalizados ─────────────────────────────────────────── */
+
+@layer components {
+  .sidebar-nav-item {
+    @apply flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium
+           text-white/80 hover:text-white hover:bg-white/10
+           transition-all duration-200 cursor-pointer;
+  }
+
+  .sidebar-nav-item.active {
+    @apply bg-white/20 text-white;
+  }
+
+  .kpi-card {
+    @apply bg-card border border-border rounded-xl p-5 shadow-sm
+           hover:shadow-md transition-shadow duration-200;
+  }
+
+  .data-table th {
+    @apply text-xs font-semibold uppercase tracking-wider text-muted-foreground
+           bg-muted/50 px-4 py-3;
+  }
+
+  .data-table td {
+    @apply px-4 py-3 text-sm;
+  }
+
+  .data-table tr:hover td {
+    @apply bg-muted/30;
+  }
+
+  .badge-vencido {
+    @apply bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400;
+  }
+
+  .badge-proximo {
+    @apply bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400;
+  }
+
+  .badge-al-dia {
+    @apply bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400;
+  }
+
+  .chat-bubble-user {
+    @apply bg-primary text-primary-foreground rounded-2xl rounded-br-sm;
+  }
+
+  .chat-bubble-assistant {
+    @apply bg-muted rounded-2xl rounded-bl-sm;
+  }
+
+  .skeleton {
+    @apply animate-pulse bg-muted rounded-lg;
+  }
+
+  /* ── Logo: contenedor blanco para mostrar el logo PNG con su fondo original ── */
+  /* Usado en sidebar y header para que el logo se vea con sus colores reales    */
+  .logo-container {
+    @apply bg-white rounded-lg px-2 py-1 inline-flex items-center;
+  }
+
+  /* En el sidebar colapsado, logo circular */
+  .logo-container-sm {
+    @apply bg-white rounded-lg p-1 inline-flex items-center justify-center;
+  }
+}
+
+/* ─── Animaciones ────────────────────────────────────────────────────────── */
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease-out;
+  }
+
+  .animate-slide-up {
+    animation: slideUp 0.4s ease-out;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
