@@ -2,29 +2,21 @@
 
 // Sidebar fijo con navegación principal de CALA ASOCIADOS
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { UserRole } from '@/types'
 import {
   LayoutDashboard,
-  Users,
-  Calendar,
-  Bell,
-  MessageSquare,
-  BarChart3,
-  Settings,
   LogOut,
   ChevronLeft,
   ChevronRight,
-  CheckSquare,
-  ClipboardList,
   FileSpreadsheet,
   Receipt,
   Calculator,
+  Settings,
 } from 'lucide-react'
 import Image from 'next/image'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
 import { useState } from 'react'
 
 interface NavItem {
@@ -32,44 +24,13 @@ interface NavItem {
   label: string
   icon: React.ElementType
   roles: UserRole[]
-  badge?: number
 }
 
 const NAV_ITEMS: NavItem[] = [
   {
     href: '/',
-    label: 'Dashboard',
+    label: 'Panel',
     icon: LayoutDashboard,
-    roles: ['administrador', 'contador', 'cliente'],
-  },
-  {
-    href: '/clientes',
-    label: 'Clientes',
-    icon: Users,
-    roles: ['administrador', 'contador'],
-  },
-  {
-    href: '/calendario',
-    label: 'Calendario Tributario',
-    icon: Calendar,
-    roles: ['administrador', 'contador', 'cliente'],
-  },
-  {
-    href: '/recordatorios',
-    label: 'Recordatorios',
-    icon: Bell,
-    roles: ['administrador', 'contador'],
-  },
-  {
-    href: '/declaraciones',
-    label: 'Declaraciones',
-    icon: ClipboardList,
-    roles: ['administrador', 'contador', 'cliente'],
-  },
-  {
-    href: '/tareas',
-    label: 'Tareas',
-    icon: CheckSquare,
     roles: ['administrador', 'contador', 'cliente'],
   },
   {
@@ -88,18 +49,6 @@ const NAV_ITEMS: NavItem[] = [
     href: '/consolidacion-iva',
     label: 'Consolidación IVA',
     icon: Calculator,
-    roles: ['administrador', 'contador'],
-  },
-  {
-    href: '/chatbot',
-    label: 'AsistenteConta',
-    icon: MessageSquare,
-    roles: ['administrador', 'contador', 'cliente'],
-  },
-  {
-    href: '/reportes',
-    label: 'Reportes',
-    icon: BarChart3,
     roles: ['administrador', 'contador'],
   },
   {
@@ -180,8 +129,9 @@ export function Sidebar({ userRole, userName }: SidebarProps) {
         {visibleItems.map((item) => {
           const Icon = item.icon
           const isActive =
-            pathname === item.href ||
-            (item.href !== '/' && pathname.startsWith(item.href))
+            item.href === '/'
+              ? pathname === '/'
+              : pathname.startsWith(item.href)
 
           return (
             <Link
@@ -196,20 +146,7 @@ export function Sidebar({ userRole, userName }: SidebarProps) {
               title={collapsed ? item.label : undefined}
             >
               <Icon className="w-5 h-5 flex-shrink-0" aria-hidden="true" />
-              {!collapsed && (
-                <span className="truncate">{item.label}</span>
-              )}
-              {item.badge !== undefined && item.badge > 0 && (
-                <span
-                  className={cn(
-                    'flex items-center justify-center w-5 h-5 text-xs rounded-full bg-accent text-primary-dark font-semibold',
-                    collapsed ? 'absolute -top-1 -right-1' : 'ml-auto'
-                  )}
-                  aria-label={`${item.badge} notificaciones`}
-                >
-                  {item.badge > 99 ? '99+' : item.badge}
-                </span>
-              )}
+              {!collapsed && <span className="truncate">{item.label}</span>}
             </Link>
           )
         })}
@@ -234,9 +171,7 @@ export function Sidebar({ userRole, userName }: SidebarProps) {
           title={collapsed ? 'Cerrar sesión' : undefined}
         >
           <LogOut className="w-5 h-5 flex-shrink-0" aria-hidden="true" />
-          {!collapsed && (
-            <span>{loggingOut ? 'Saliendo...' : 'Cerrar sesión'}</span>
-          )}
+          {!collapsed && <span>{loggingOut ? 'Saliendo...' : 'Cerrar sesión'}</span>}
         </button>
       </div>
     </aside>

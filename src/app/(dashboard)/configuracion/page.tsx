@@ -1,21 +1,21 @@
-// Página: Configuración del sistema (solo administrador)
-import { createClient } from '@/lib/supabase/server'
+// src/app/(dashboard)/configuracion/page.tsx
+// Configuración del sistema: usuarios, conexiones y clientes configurados
 import { redirect } from 'next/navigation'
-import Link from 'next/link'
-import { Users, MessageSquare, Bell, Calendar, Shield, Cpu, Server, BookOpen } from 'lucide-react'
+import { createClient } from '@/lib/supabase/server'
+import { UsuariosPanel } from '@/components/configuracion/UsuariosPanel'
+import { EstadoSistema } from '@/components/configuracion/EstadoSistema'
+import { Building2 } from 'lucide-react'
 
-export const metadata = {
-  title: 'Configuración | CALA ASOCIADOS',
-}
+export const dynamic = 'force-dynamic'
 
 export default async function ConfiguracionPage() {
   const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
 
+  const { data: { user } } = await supabase.auth.getUser()
   if (!user) redirect('/login')
 
+  // Solo el administrador entra aquí (el middleware ya lo protege,
+  // pero se valida de nuevo por seguridad)
   const { data: profile } = await supabase
     .from('profiles')
     .select('role')
@@ -26,114 +26,76 @@ export default async function ConfiguracionPage() {
     redirect('/?error=sin_permisos')
   }
 
-  const CONFIG_SECTIONS = [
-    {
-      href: '/configuracion/usuarios',
-      title: 'Gestión de Usuarios',
-      description: 'Crear y administrar contadores y clientes del sistema',
-      icon: Users,
-      color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400',
-    },
-    {
-      href: '/configuracion/whatsapp',
-      title: 'Configuración WhatsApp',
-      description: 'Plantillas de mensajes, credenciales API y número de envío',
-      icon: MessageSquare,
-      color: 'bg-green-500/10 text-green-600 dark:text-green-400',
-    },
-    {
-      href: '/recordatorios/configuracion',
-      title: 'Recordatorios Automáticos',
-      description: 'Días de antelación, frecuencia y destinatarios',
-      icon: Bell,
-      color: 'bg-amber-500/10 text-amber-600 dark:text-amber-400',
-    },
-    {
-      href: '/calendario',
-      title: 'Calendario Tributario',
-      description: 'Ver y actualizar fechas de vencimiento DIAN',
-      icon: Calendar,
-      color: 'bg-primary/10 text-primary',
-    },
-    {
-      href: '/chatbot',
-      title: 'AsistenteConta IA',
-      description: 'Ver conversaciones y agregar preguntas frecuentes',
-      icon: Cpu,
-      color: 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
-    },
-    {
-      href: '/configuracion/faqs',
-      title: 'Base de Conocimiento',
-      description: 'Gestionar FAQs que usa el chatbot para responder consultas',
-      icon: BookOpen,
-      color: 'bg-orange-500/10 text-orange-600 dark:text-orange-400',
-    },
-    {
-      href: '/configuracion/sistema',
-      title: 'Estado del Sistema',
-      description: 'Variables de entorno, enviar recordatorios manualmente y diagnóstico',
-      icon: Server,
-      color: 'bg-slate-500/10 text-slate-600 dark:text-slate-400',
-    },
-  ]
+  // Perfiles de cliente guardados
+  const { data: perfiles } = await supabase
+    .from('perfiles_cliente')
+    .select('nit, nombre_empresa, instrucciones_contador, actualizado_en')
+    .order('actualizado_en', { ascending: false })
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="space-y-6 max-w-5xl">
       <div>
-        <h1 className="text-2xl font-display font-bold text-foreground">
-          Configuración del Sistema
-        </h1>
-        <p className="text-muted-foreground mt-1">
-          Administra todos los parámetros de CALA ASOCIADOS
+        <h2 className="text-2xl font-display font-semibold text-foreground">
+          Configuración del sistema
+        </h2>
+        <p className="text-muted-foreground text-sm mt-1">
+          Usuarios, conexiones y clientes configurados.
         </p>
       </div>
 
-      {/* Banner de administrador */}
-      <div className="flex items-center gap-3 p-4 bg-primary/5 border border-primary/20 rounded-xl">
-        <Shield className="w-5 h-5 text-primary flex-shrink-0" aria-hidden="true" />
-        <p className="text-sm text-foreground">
-          Estás en el panel de <strong>administrador</strong>. Los cambios afectan a todo el sistema.
-        </p>
-      </div>
+      {/* Estado de las conexiones */}
+      <EstadoSistema />
 
-      {/* Secciones de configuración */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {CONFIG_SECTIONS.map((section) => {
-          const Icon = section.icon
-          return (
-            <Link
-              key={section.href}
-              href={section.href}
-              className="flex items-start gap-4 p-5 bg-card border border-border rounded-xl hover:bg-muted/30 hover:border-primary/30 transition-all group"
-            >
-              <div
-                className={`p-3 rounded-xl flex-shrink-0 ${section.color} group-hover:scale-110 transition-transform`}
-              >
-                <Icon className="w-5 h-5" aria-hidden="true" />
+      {/* Gestión de usuarios */}
+      <UsuariosPanel miId={user.id} />
+
+      {/* Clientes configurados */}
+      <section className="bg-card border border-border rounded-xl">
+        <div className="p-5 border-b border-border">
+          <h3 className="font-semibold text-foreground flex items-center gap-2">
+            <Building2 className="w-4 h-4 text-primary" aria-hidden="true" />
+            Clientes configurados
+          </h3>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Perfiles guardados que el Motor Contable reutiliza automáticamente.
+          </p>
+        </div>
+
+        {!perfiles || perfiles.length === 0 ? (
+          <div className="p-10 text-center text-muted-foreground text-sm">
+            Aún no hay clientes configurados. Se crean al generar un ESF.
+          </div>
+        ) : (
+          <div className="divide-y divide-border">
+            {perfiles.map((p) => (
+              <div key={p.nit} className="px-5 py-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-foreground truncate">
+                      {p.nombre_empresa || 'Sin nombre'}
+                    </p>
+                    <p className="text-xs text-muted-foreground">NIT {p.nit}</p>
+                  </div>
+                  <p className="text-xs text-muted-foreground flex-shrink-0">
+                    {p.actualizado_en
+                      ? new Date(p.actualizado_en).toLocaleDateString('es-CO', {
+                          day: '2-digit',
+                          month: 'short',
+                          year: 'numeric',
+                        })
+                      : '—'}
+                  </p>
+                </div>
+                {p.instrucciones_contador && (
+                  <p className="text-xs text-muted-foreground/80 mt-1.5 italic line-clamp-2">
+                    &ldquo;{p.instrucciones_contador}&rdquo;
+                  </p>
+                )}
               </div>
-              <div className="min-w-0">
-                <p className="font-semibold text-foreground group-hover:text-primary transition-colors">
-                  {section.title}
-                </p>
-                <p className="text-sm text-muted-foreground mt-1 leading-snug">
-                  {section.description}
-                </p>
-              </div>
-            </Link>
-          )
-        })}
-      </div>
-
-      {/* Info de versión */}
-      <div className="p-4 bg-muted/30 border border-border rounded-xl text-center">
-        <p className="text-xs text-muted-foreground">
-          CALA ASOCIADOS v1.0.0 — Sistema de Gestión Contable con IA
-        </p>
-        <p className="text-xs text-muted-foreground mt-1">
-          Stack: Next.js 14 · Supabase · Groq (Llama 3.3) · Vercel
-        </p>
-      </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   )
 }

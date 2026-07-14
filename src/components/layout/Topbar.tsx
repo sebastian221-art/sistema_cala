@@ -1,24 +1,21 @@
 'use client'
 
-// Topbar superior con búsqueda, notificaciones y toggle de tema
+// Topbar superior con título de sección, toggle de tema y usuario
 import { useState, useEffect } from 'react'
-import { Search, Sun, Moon, Monitor, ChevronDown } from 'lucide-react'
+import { Sun, Moon, Monitor, ChevronDown } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { cn } from '@/lib/utils'
 import { UserRole } from '@/types'
 import { getInitials } from '@/lib/utils'
-import { NotificationBell } from './NotificationBell'
 
 interface TopbarProps {
   title: string
   userName: string
   userRole: UserRole
-  notificationCount?: number
 }
 
 export function Topbar({ title, userName, userRole }: TopbarProps) {
   const { theme, setTheme } = useTheme()
-  const [searchQuery, setSearchQuery] = useState('')
   const [themeMenuOpen, setThemeMenuOpen] = useState(false)
   const [mounted, setMounted] = useState(false)
 
@@ -31,7 +28,13 @@ export function Topbar({ title, userName, userRole }: TopbarProps) {
   ]
 
   // Evitar hidratación: usar Monitor como icono neutro hasta que el cliente monte
-  const ThemeIcon = !mounted ? Monitor : theme === 'dark' ? Moon : theme === 'light' ? Sun : Monitor
+  const ThemeIcon = !mounted
+    ? Monitor
+    : theme === 'dark'
+    ? Moon
+    : theme === 'light'
+    ? Sun
+    : Monitor
 
   return (
     <header
@@ -44,30 +47,6 @@ export function Topbar({ title, userName, userRole }: TopbarProps) {
           {title}
         </h1>
       </div>
-
-      {/* Barra de búsqueda */}
-      <div className="relative hidden md:flex items-center">
-        <Search
-          className="absolute left-3 w-4 h-4 text-muted-foreground"
-          aria-hidden="true"
-        />
-        <input
-          type="search"
-          placeholder="Buscar clientes, obligaciones..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          className={cn(
-            'pl-9 pr-4 py-2 text-sm rounded-lg border border-border bg-background',
-            'text-foreground placeholder:text-muted-foreground',
-            'focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent',
-            'w-64 transition-all duration-200'
-          )}
-          aria-label="Buscar en el sistema"
-        />
-      </div>
-
-      {/* Centro de notificaciones */}
-      <NotificationBell />
 
       {/* Toggle de tema */}
       <div className="relative">
@@ -98,8 +77,8 @@ export function Topbar({ title, userName, userRole }: TopbarProps) {
                   className={cn(
                     'w-full flex items-center gap-2 px-3 py-2 text-sm transition-colors',
                     theme === option.value
-                      ? 'bg-primary/10 text-primary'
-                      : 'text-foreground hover:bg-muted'
+                      ? 'bg-muted text-foreground font-medium'
+                      : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                   )}
                   role="menuitem"
                 >
@@ -112,19 +91,19 @@ export function Topbar({ title, userName, userRole }: TopbarProps) {
         )}
       </div>
 
-      {/* Avatar del usuario */}
+      {/* Usuario */}
       <div className="flex items-center gap-2.5">
-        <div
-          className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-xs font-semibold flex-shrink-0"
-          aria-hidden="true"
-        >
-          {getInitials(userName)}
-        </div>
-        <div className="hidden sm:block min-w-0">
-          <p className="text-sm font-medium text-foreground leading-tight truncate max-w-28">
+        <div className="hidden sm:block text-right leading-tight">
+          <p className="text-sm font-medium text-foreground truncate max-w-40">
             {userName}
           </p>
           <p className="text-xs text-muted-foreground capitalize">{userRole}</p>
+        </div>
+        <div
+          className="flex items-center justify-center w-9 h-9 rounded-full bg-primary text-primary-foreground text-sm font-semibold flex-shrink-0"
+          aria-hidden="true"
+        >
+          {getInitials(userName)}
         </div>
       </div>
     </header>

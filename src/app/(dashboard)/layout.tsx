@@ -11,33 +11,18 @@ import { headers } from 'next/headers'
 // Títulos de página por ruta
 function getPageTitle(pathname: string): string {
   const titles: Record<string, string> = {
-    '/': 'Dashboard',
-    '/clientes': 'Gestión de Clientes',
-    '/clientes/nuevo': 'Nuevo Cliente',
-    '/calendario': 'Calendario Tributario',
-    '/recordatorios': 'Recordatorios',
-    '/recordatorios/configuracion': 'Configuración de Recordatorios',
+    '/': 'Panel',
     '/motor-contable': 'Motor Contable',
     '/formulario-1647': 'Formulario 1647',
-    '/chatbot': 'AsistenteConta',
-    '/reportes': 'Reportes',
+    '/consolidacion-iva': 'Consolidación IVA',
     '/configuracion': 'Configuración del Sistema',
-    '/configuracion/usuarios': 'Gestión de Usuarios',
-    '/configuracion/whatsapp': 'Configuración WhatsApp',
   }
 
-  // Buscar coincidencia exacta primero
   if (titles[pathname]) return titles[pathname]
 
-  // Buscar por prefijo para rutas dinámicas
-  if (pathname.startsWith('/clientes/') && pathname.endsWith('/financiero')) {
-    return 'Estados Financieros'
-  }
-  if (pathname.startsWith('/clientes/') && pathname.endsWith('/impuestos')) {
-    return 'Obligaciones Tributarias'
-  }
-  if (pathname.startsWith('/clientes/')) {
-    return 'Perfil del Cliente'
+  // Coincidencia por prefijo (rutas anidadas)
+  for (const [ruta, titulo] of Object.entries(titles)) {
+    if (ruta !== '/' && pathname.startsWith(ruta)) return titulo
   }
 
   return 'CALA ASOCIADOS'

@@ -3,10 +3,10 @@ import { NextResponse, type NextRequest } from 'next/server'
 import { updateSession } from '@/lib/supabase/middleware'
 
 // Rutas públicas (sin autenticación requerida)
-const PUBLIC_ROUTES = ['/login', '/forgot-password', '/api/webhooks/whatsapp']
+const PUBLIC_ROUTES = ['/login', '/forgot-password']
 
 // Rutas solo para administrador
-const ADMIN_ONLY_ROUTES = ['/configuracion', '/reportes']
+const ADMIN_ONLY_ROUTES = ['/configuracion', '/api/admin']
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl
@@ -16,12 +16,8 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // Permitir rutas de assets y API de cron
-  if (
-    pathname.startsWith('/_next') ||
-    pathname.startsWith('/api/cron') ||
-    pathname.includes('.')
-  ) {
+  // Permitir assets estáticos
+  if (pathname.startsWith('/_next') || pathname.includes('.')) {
     return NextResponse.next()
   }
 
