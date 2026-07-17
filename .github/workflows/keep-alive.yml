@@ -1,0 +1,16 @@
+name: Mantener CALA despierto
+
+on:
+  schedule:
+    # Todos los días a las 12:00 UTC (7:00 AM Colombia)
+    - cron: '0 12 * * *'
+  workflow_dispatch:   # Botón para ejecutarlo a mano y probar
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping a CALA
+        run: |
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+            https://sistemacala-production.up.railway.app/login
