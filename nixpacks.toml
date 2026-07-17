@@ -1,13 +1,7 @@
-# Railway (Nixpacks) — Node + Python con librerías incluidas vía Nix.
-# NO usa pip (que no funciona en el Python sellado de Nix).
-# En su lugar, Nix instala python311 junto con openpyxl y lxml directamente.
-
 [phases.setup]
 nixPkgs = [
   'nodejs_20',
-  'python311',
-  'python311Packages.openpyxl',
-  'python311Packages.lxml'
+  '(python311.withPackages (ps: with ps; [ openpyxl lxml ]))'
 ]
 
 [phases.install]
