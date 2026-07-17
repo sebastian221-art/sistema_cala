@@ -1,45 +1,51 @@
 #!/usr/bin/env python3
 """
-Motor de Consolidacion de IVA (modulo CALA).
+Motor de Consolidacion de IVA (CALA) — VERSION 2, dos pasos.
 
-Recibe el LISTADO de la DIAN (el Excel "token dian", Rp_Doc_*) y, opcionalmente,
-los XML de las facturas (carpeta o zip). Cruza por CUFE y genera un Excel con:
-  - Hojas VENTAS, COMPRAS, NOMINA, DOCUMENTO SOPORTE (detalle)
-  - Hoja ACUMULADO (resumen del periodo)
+MODO PREVIEW:
+    python3 consolidar_iva.py preview <listado.xlsx> [--tarifas <json_nit_tarifa>]
+    -> devuelve JSON con todas las facturas y su tarifa presunta.
 
-Cuando hay XML, el IVA se discrimina REAL al 19% / 5% / exento.
-Cuando falta el XML de un CUFE, cae a un supuesto de 19% (IVA/19%) y lo marca
-en la columna "Origen" como "Asumido 19%" para que la contadora lo revise.
+MODO GENERAR:
+    python3 consolidar_iva.py generar <listado.xlsx> <salida.xlsx> <decisiones_json>
+    -> decisiones_json: ruta a un JSON { cufe: tarifa }. Genera el Excel.
 
-Uso:
-    python3 consolidar_iva.py <listado.xlsx> <salida.xlsx> [xml: carpeta|zip]
-
-Salida: el archivo .xlsx en la ruta indicada + un JSON-resumen a stdout.
-Requiere: pip install openpyxl lxml --break-system-packages
+Requiere: pip install openpyxl --break-system-packages
 """
 import sys
 import io
 import json
 import unicodedata
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-
-from leer_xml import cargar_xmls
 
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-# ---- Indices de columna (0-based) del listado DIAN (Rp_Doc) ----
+# ---- Columnas del listado DIAN (Rp_Doc), 0-based ----
 C_TIPO, C_CUFE, C_FOLIO, C_PREFIJO = 0, 1, 2, 3
-C_FORMA_PAGO, C_MEDIO_PAGO = 5, 6
+C_FORMA_PAGO = 5
 C_FECHA_EMI = 7
 C_NIT_EMI, C_NOM_EMI, C_NIT_REC, C_NOM_REC = 9, 10, 11, 12
 C_IVA = 13
 C_RETE_IVA, C_RETE_RENTA, C_RETE_ICA = 26, 27, 28
 C_TOTAL, C_ESTADO, C_GRUPO = 29, 30, 31
-# Impuestos de consumo (no IVA, no retencion) que SI hacen parte del total
-C_OTROS = list(range(14, 26))  # ICA..ICUI
+C_OTROS = list(range(14, 26))
+
+ENCABEZADOS = [
+    "Tipo de documento", "CUFE/CUDE", "Folio", "Prefijo", "Fecha Emisión",
+    "NIT Emisor", "Nombre Emisor", "NIT Receptor", "Nombre Receptor", "Forma Pago",
+    "Base Exenta", "Base Gravada 19%", "Base Gravada 5%",
+    "IVA 19%", "IVA 5%", "IVA Total", "Otros Impuestos",
+    "Rete IVA", "Rete Renta", "Rete ICA",
+    "TOTAL Calculado", "Total DIAN", "Diferencia", "Tarifa", "Estado",
+]
+COL = {name: get_column_letter(i + 1) for i, name in enumerate(ENCABEZADOS)}
+NEGRITA = Font(bold=True, color="FFFFFF")
+RELLENO_HEAD = PatternFill("solid", fgColor="1F4E78")
+RELLENO_TOT = PatternFill("solid", fgColor="DDEBF7")
+MONEDA = '#,##0;(#,##0);"-"'
 
 
 def _norm(s):
@@ -49,19 +55,18 @@ def _norm(s):
 
 
 def clasificar(tipo, grupo):
-    """Devuelve (hoja, es_nota_credito) o (None, _) si se debe excluir."""
     t, g = _norm(tipo), _norm(grupo)
     if "application response" in t:
-        return None, False            # eventos, no son facturas
+        return None, False
     es_nc = "nota" in t and "credito" in t
     if g == "emitido":
         if "nomina" in t:
             return "NOMINA", False
         if "documento soporte" in t:
             return "DOCUMENTO SOPORTE", False
-        return "VENTAS", es_nc        # factura, nota debito/credito, contingencia
+        return "VENTAS", es_nc
     if g == "recibido":
-        return "COMPRAS", es_nc        # incluye doc equivalente / POS
+        return "COMPRAS", es_nc
     return None, False
 
 
@@ -72,95 +77,127 @@ def fnum(v):
         return 0.0
 
 
-# ---- Layout de las hojas de detalle ----
-ENCABEZADOS = [
-    "Tipo de documento", "CUFE/CUDE", "Folio", "Prefijo", "Fecha Emisión",
-    "NIT Emisor", "Nombre Emisor", "NIT Receptor", "Nombre Receptor", "Forma Pago",
-    "Base Exenta", "Base Gravada 19%", "Base Gravada 5%",
-    "IVA 19%", "IVA 5%", "IVA Total", "Otros Impuestos",
-    "Rete IVA", "Rete Renta", "Rete ICA",
-    "TOTAL Calculado", "Total DIAN", "Diferencia", "Origen", "Estado",
-]
-# Letras de columna por nombre, para construir formulas
-COL = {name: get_column_letter(i + 1) for i, name in enumerate(ENCABEZADOS)}
-
-AZUL = Font(color="0000FF")
-NEGRO = Font(color="000000")
-NEGRITA = Font(bold=True, color="FFFFFF")
-RELLENO_HEAD = PatternFill("solid", fgColor="1F4E78")
-RELLENO_TOT = PatternFill("solid", fgColor="DDEBF7")
-BORDE = Border(*[Side(style="thin", color="BFBFBF")] * 4)
-MONEDA = '#,##0;(#,##0);"-"'
+def _celda(fila, idx):
+    return fila[idx] if idx < len(fila) else None
 
 
-def construir(listado_path, salida_path, xml_path=None):
-    wb_in = load_workbook(listado_path, read_only=True, data_only=True)
-    ws_in = wb_in[wb_in.sheetnames[0]]
-    filas = list(ws_in.iter_rows(values_only=True))[1:]  # sin encabezado
+def leer_facturas(listado_path):
+    wb = load_workbook(listado_path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    filas = list(ws.iter_rows(values_only=True))
 
-    xml_idx, xml_err = ({}, [])
-    if xml_path:
-        xml_idx, xml_err = cargar_xmls(xml_path)
+    inicio = 1
+    for i, fila in enumerate(filas[:15]):
+        textos = [_norm(str(c)) for c in fila if c is not None]
+        if any("cufe" in t or "cude" in t for t in textos):
+            inicio = i + 1
+            break
 
-    # Agrupar filas por hoja de destino
-    hojas = {"VENTAS": [], "COMPRAS": [], "NOMINA": [], "DOCUMENTO SOPORTE": []}
-    resumen = {"total_filas": 0, "excluidas": 0, "con_xml": 0, "asumidas": 0}
-
-    for r in filas:
-        if r is None or r[C_TIPO] is None:
+    out = []
+    for fila in filas[inicio:]:
+        if fila is None or _celda(fila, C_TIPO) is None:
             continue
-        resumen["total_filas"] += 1
-        hoja, es_nc = clasificar(r[C_TIPO], r[C_GRUPO])
+        hoja, es_nc = clasificar(_celda(fila, C_TIPO), _celda(fila, C_GRUPO))
         if hoja is None:
-            resumen["excluidas"] += 1
             continue
-
-        cufe = r[C_CUFE]
-        iva_tok = fnum(r[C_IVA])
-        total = fnum(r[C_TOTAL])
-        otros = sum(fnum(r[i]) for i in C_OTROS)
-
-        x = xml_idx.get(cufe)
-        if x:                                   # IVA real del XML
-            base_ex, base19, base5 = x["base_exenta"], x["base_19"], x["base_5"]
-            iva19, iva5 = x["iva_19"], x["iva_5"]
-            origen = "XML"
-            resumen["con_xml"] += 1
-        else:                                   # supuesto 19% (sin XML)
-            iva19, iva5 = iva_tok, 0.0
-            base19 = round(iva_tok / 0.19, 2) if iva_tok else 0.0
-            base5 = 0.0
-            base_ex = round(total - base19 - iva19 - otros, 2)
-            origen = "Asumido 19%"
-            resumen["asumidas"] += 1
-
-        signo = -1 if es_nc else 1
-        hojas[hoja].append({
-            "tipo": r[C_TIPO], "cufe": cufe, "folio": r[C_FOLIO],
-            "prefijo": r[C_PREFIJO], "fecha": r[C_FECHA_EMI],
-            "nit_emi": r[C_NIT_EMI], "nom_emi": r[C_NOM_EMI],
-            "nit_rec": r[C_NIT_REC], "nom_rec": r[C_NOM_REC],
-            "forma": r[C_FORMA_PAGO],
-            "base_ex": signo * base_ex, "base19": signo * base19,
-            "base5": signo * base5, "iva19": signo * iva19, "iva5": signo * iva5,
-            "otros": signo * otros,
-            "rete_iva": signo * fnum(r[C_RETE_IVA]),
-            "rete_renta": signo * fnum(r[C_RETE_RENTA]),
-            "rete_ica": signo * fnum(r[C_RETE_ICA]),
-            "total_dian": signo * total, "origen": origen, "estado": r[C_ESTADO],
+        out.append({
+            "cufe": str(_celda(fila, C_CUFE) or ""),
+            "hoja": hoja, "es_nc": es_nc,
+            "tipo": str(_celda(fila, C_TIPO) or ""),
+            "folio": _celda(fila, C_FOLIO),
+            "prefijo": _celda(fila, C_PREFIJO),
+            "fecha": str(_celda(fila, C_FECHA_EMI) or ""),
+            "nit_emi": str(_celda(fila, C_NIT_EMI) or ""),
+            "nom_emi": str(_celda(fila, C_NOM_EMI) or ""),
+            "nit_rec": str(_celda(fila, C_NIT_REC) or ""),
+            "nom_rec": str(_celda(fila, C_NOM_REC) or ""),
+            "forma": str(_celda(fila, C_FORMA_PAGO) or ""),
+            "iva_dian": fnum(_celda(fila, C_IVA)),
+            "otros": sum(fnum(_celda(fila, i)) for i in C_OTROS),
+            "rete_iva": fnum(_celda(fila, C_RETE_IVA)),
+            "rete_renta": fnum(_celda(fila, C_RETE_RENTA)),
+            "rete_ica": fnum(_celda(fila, C_RETE_ICA)),
+            "total_dian": fnum(_celda(fila, C_TOTAL)),
+            "estado": str(_celda(fila, C_ESTADO) or ""),
         })
+    return out
 
+
+def _nit_prov(f):
+    return f["nit_emi"] if f["hoja"] == "COMPRAS" else f["nit_rec"]
+
+
+def _nom_prov(f):
+    return f["nom_emi"] if f["hoja"] == "COMPRAS" else f["nom_rec"]
+
+
+def modo_preview(listado_path, tarifas_conocidas):
+    facturas = leer_facturas(listado_path)
+    filas = []
+    for f in facturas:
+        nit = _nit_prov(f)
+        if nit in tarifas_conocidas:
+            tarifa, origen = tarifas_conocidas[nit], "conocido"
+        else:
+            tarifa, origen = 19, "presunto"
+        filas.append({
+            "cufe": f["cufe"], "hoja": f["hoja"], "tipo": f["tipo"],
+            "fecha": f["fecha"], "nit_proveedor": nit,
+            "nombre_proveedor": _nom_prov(f),
+            "iva_dian": f["iva_dian"], "total_dian": f["total_dian"],
+            "es_nc": f["es_nc"], "tarifa": tarifa, "origen": origen,
+        })
+    return {"total": len(filas), "facturas": filas}
+
+
+def _bases(f, tarifa):
+    iva, total, otros = f["iva_dian"], f["total_dian"], f["otros"]
+    base_ex = base19 = base5 = iva19 = iva5 = 0.0
+    if tarifa == 19:
+        iva19 = iva
+        base19 = round(iva / 0.19, 2) if iva else 0.0
+        base_ex = round(total - base19 - iva19 - otros, 2)
+    elif tarifa == 5:
+        iva5 = iva
+        base5 = round(iva / 0.05, 2) if iva else 0.0
+        base_ex = round(total - base5 - iva5 - otros, 2)
+    elif tarifa == 0:
+        base_ex = round(total - otros, 2)
+    else:
+        t = tarifa / 100.0
+        if t > 0 and iva:
+            base19 = round(iva / t, 2)
+            iva19 = iva
+            base_ex = round(total - base19 - iva - otros, 2)
+        else:
+            base_ex = round(total - otros, 2)
+    return base_ex, base19, base5, iva19, iva5
+
+
+def modo_generar(listado_path, salida_path, decisiones):
+    facturas = leer_facturas(listado_path)
+    hojas = {"VENTAS": [], "COMPRAS": [], "NOMINA": [], "DOCUMENTO SOPORTE": []}
+    resumen = {"total_filas": 0, "por_tarifa": {}}
+    for f in facturas:
+        resumen["total_filas"] += 1
+        tarifa = decisiones.get(f["cufe"], 19)
+        k = "Exento" if tarifa == 0 else f"{tarifa}%"
+        resumen["por_tarifa"][k] = resumen["por_tarifa"].get(k, 0) + 1
+        be, b19, b5, i19, i5 = _bases(f, tarifa)
+        s = -1 if f["es_nc"] else 1
+        hojas[f["hoja"]].append({
+            **f, "base_ex": s*be, "base19": s*b19, "base5": s*b5,
+            "iva19": s*i19, "iva5": s*i5, "otros_s": s*f["otros"],
+            "rete_iva_s": s*f["rete_iva"], "rete_renta_s": s*f["rete_renta"],
+            "rete_ica_s": s*f["rete_ica"], "total_s": s*f["total_dian"], "tarifa": tarifa,
+        })
     wb = Workbook()
     wb.remove(wb.active)
-    totales_por_hoja = {}
+    totales = {}
     for nombre in ["VENTAS", "COMPRAS", "NOMINA", "DOCUMENTO SOPORTE"]:
-        fila_tot = _escribir_hoja(wb, nombre, hojas[nombre])
-        totales_por_hoja[nombre] = fila_tot
-
-    _escribir_acumulado(wb, totales_por_hoja)
+        totales[nombre] = _escribir_hoja(wb, nombre, hojas[nombre])
+    _escribir_acumulado(wb, totales)
     wb.save(salida_path)
-
-    resumen["errores_xml"] = xml_err
     return resumen
 
 
@@ -168,74 +205,53 @@ def _escribir_hoja(wb, nombre, registros):
     ws = wb.create_sheet(nombre)
     for j, h in enumerate(ENCABEZADOS, start=1):
         c = ws.cell(1, j, h)
-        c.font = NEGRITA
-        c.fill = RELLENO_HEAD
+        c.font = NEGRITA; c.fill = RELLENO_HEAD
         c.alignment = Alignment(horizontal="center", wrap_text=True)
-
     fila = 2
-    for reg in registros:
-        vals = [reg["tipo"], reg["cufe"], reg["folio"], reg["prefijo"], reg["fecha"],
-                reg["nit_emi"], reg["nom_emi"], reg["nit_rec"], reg["nom_rec"], reg["forma"],
-                reg["base_ex"], reg["base19"], reg["base5"], reg["iva19"], reg["iva5"]]
+    for r in registros:
+        vals = [r["tipo"], r["cufe"], r["folio"], r["prefijo"], r["fecha"],
+                r["nit_emi"], r["nom_emi"], r["nit_rec"], r["nom_rec"], r["forma"],
+                r["base_ex"], r["base19"], r["base5"], r["iva19"], r["iva5"]]
         for j, v in enumerate(vals, start=1):
             ws.cell(fila, j, v)
-        # IVA Total, TOTAL Calculado y Diferencia como FORMULAS
-        ws.cell(fila, 16, f"={COL['IVA 19%']}{fila}+{COL['IVA 5%']}{fila}")
-        ws.cell(fila, 17, reg["otros"])
-        ws.cell(fila, 18, reg["rete_iva"])
-        ws.cell(fila, 19, reg["rete_renta"])
-        ws.cell(fila, 20, reg["rete_ica"])
-        ws.cell(fila, 21, (f"={COL['Base Exenta']}{fila}+{COL['Base Gravada 19%']}{fila}"
-                           f"+{COL['Base Gravada 5%']}{fila}+{COL['IVA 19%']}{fila}"
-                           f"+{COL['IVA 5%']}{fila}+{COL['Otros Impuestos']}{fila}"))
-        ws.cell(fila, 22, reg["total_dian"])
-        ws.cell(fila, 23, f"={COL['Total DIAN']}{fila}-{COL['TOTAL Calculado']}{fila}")
-        ws.cell(fila, 24, reg["origen"])
-        ws.cell(fila, 25, reg["estado"])
-        for j in range(11, 24):
-            ws.cell(fila, j).number_format = MONEDA
-            ws.cell(fila, j).font = NEGRO
+        ws.cell(fila, 16, f"=N{fila}+O{fila}")
+        ws.cell(fila, 17, r["otros_s"])
+        ws.cell(fila, 18, r["rete_iva_s"])
+        ws.cell(fila, 19, r["rete_renta_s"])
+        ws.cell(fila, 20, r["rete_ica_s"])
+        ws.cell(fila, 21, f"=K{fila}+L{fila}+M{fila}+P{fila}+Q{fila}")
+        ws.cell(fila, 22, r["total_s"])
+        ws.cell(fila, 23, f"=V{fila}-U{fila}")
+        ws.cell(fila, 24, "Exento" if r["tarifa"] == 0 else f'{r["tarifa"]}%')
+        ws.cell(fila, 25, r["estado"])
+        for col in [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]:
+            ws.cell(fila, col).number_format = MONEDA
         fila += 1
-
-    # Fila de totales
-    ult = fila - 1
-    ws.cell(fila, 10, "TOTALES").font = Font(bold=True)
-    if ult >= 2:
-        for j in range(11, 24):
-            L = get_column_letter(j)
-            t = ws.cell(fila, j, f"=SUM({L}2:{L}{ult})")
-            t.number_format = MONEDA
-            t.font = Font(bold=True)
-            t.fill = RELLENO_TOT
-    anchos = [22, 30, 9, 9, 13, 13, 26, 13, 26, 9] + [15] * 13 + [12, 22]
+    if fila > 2:
+        ws.cell(fila, 10, "TOTALES").font = Font(bold=True)
+        for cidx in [11, 12, 13, 14, 15, 16, 21, 22]:
+            letra = get_column_letter(cidx)
+            c = ws.cell(fila, cidx, f"=SUM({letra}2:{letra}{fila-1})")
+            c.font = Font(bold=True); c.fill = RELLENO_TOT; c.number_format = MONEDA
+    anchos = [18, 30, 8, 8, 12, 14, 24, 14, 24, 12, 14, 14, 14, 14, 14,
+              14, 12, 12, 12, 12, 16, 16, 12, 10, 12]
     for i, w in enumerate(anchos, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
-    return fila  # fila de totales (para referenciar desde ACUMULADO)
+    return fila
 
 
-def _escribir_acumulado(wb, tot):
-    ws = wb.create_sheet("ACUMULADO")
-    ws["B2"] = "CONSOLIDACIÓN DE IVA DEL PERIODO"
-    ws["B2"].font = Font(bold=True, size=13)
-
+def _escribir_acumulado(wb, totales):
+    ws = wb.create_sheet("ACUMULADO", 0)
+    ws.cell(2, 2, "CONSOLIDACIÓN DE IVA").font = Font(bold=True, size=14)
     def ref(hoja, col):
-        return f"='{hoja}'!{COL[col]}{tot[hoja]}"
-
-    bloques = [
-        ("VENTAS", "VENTAS"),
-        ("COMPRAS", "COMPRAS"),
-    ]
+        return f"='{hoja}'!{COL[col]}{totales[hoja]}"
+    headers = ["Concepto", "Base Exenta", "Base 19%", "Base 5%", "IVA 19%", "IVA 5%", "IVA Total"]
     fila = 4
-    headers = ["Concepto", "Base Exenta (No Gravado)", "Base Gravada 19%",
-               "Base Gravada 5%", "IVA 19%", "IVA 5%", "IVA Total"]
     for j, h in enumerate(headers, start=2):
-        c = ws.cell(fila, j, h)
-        c.font = NEGRITA
-        c.fill = RELLENO_HEAD
+        c = ws.cell(fila, j, h); c.font = NEGRITA; c.fill = RELLENO_HEAD
         c.alignment = Alignment(horizontal="center", wrap_text=True)
     fila += 1
-    for etiqueta, hoja in bloques:
+    for etiqueta, hoja in [("VENTAS", "VENTAS"), ("COMPRAS", "COMPRAS")]:
         ws.cell(fila, 2, etiqueta).font = Font(bold=True)
         ws.cell(fila, 3, ref(hoja, "Base Exenta"))
         ws.cell(fila, 4, ref(hoja, "Base Gravada 19%"))
@@ -246,25 +262,31 @@ def _escribir_acumulado(wb, tot):
         for j in range(3, 9):
             ws.cell(fila, j).number_format = MONEDA
         fila += 1
-
-    f_ven, f_com = 5, 6
     fila += 1
     ws.cell(fila, 2, "IVA A PAGAR (Ventas - Compras)").font = Font(bold=True, size=12)
-    ws.cell(fila, 8, f"=H{f_ven}-H{f_com}")
-    ws.cell(fila, 8).number_format = MONEDA
+    ws.cell(fila, 8, "=H5-H6"); ws.cell(fila, 8).number_format = MONEDA
     ws.cell(fila, 8).font = Font(bold=True, size=12)
     ws.cell(fila, 8).fill = PatternFill("solid", fgColor="FFF2CC")
-
-    for i, w in enumerate([3, 32, 18, 18, 18, 16, 16, 18], start=1):
+    for i, w in enumerate([3, 34, 16, 16, 16, 14, 14, 16], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Uso: python3 consolidar_iva.py <listado.xlsx> <salida.xlsx> [xml]",
-              file=sys.stderr)
+    modo = sys.argv[1] if len(sys.argv) > 1 else ""
+    if modo == "preview":
+        listado = sys.argv[2]
+        tarifas = {}
+        if "--tarifas" in sys.argv:
+            tarifas = json.loads(sys.argv[sys.argv.index("--tarifas") + 1])
+        print(json.dumps(modo_preview(listado, tarifas), ensure_ascii=False, default=str))
+    elif modo == "generar":
+        listado, salida, dec_path = sys.argv[2], sys.argv[3], sys.argv[4]
+        with open(dec_path, encoding="utf-8") as fh:
+            decisiones = json.load(fh)
+        # normalizar: las claves son CUFE, los valores tarifa (int)
+        decisiones = {k: int(v) for k, v in decisiones.items()}
+        res = modo_generar(listado, salida, decisiones)
+        print(json.dumps(res, ensure_ascii=False, default=str))
+    else:
+        print(json.dumps({"error": f"Modo desconocido: {modo}"}), file=sys.stderr)
         sys.exit(1)
-    listado, salida = sys.argv[1], sys.argv[2]
-    xmls = sys.argv[3] if len(sys.argv) > 3 else None
-    res = construir(listado, salida, xmls)
-    print(json.dumps(res, ensure_ascii=False, indent=2, default=str))

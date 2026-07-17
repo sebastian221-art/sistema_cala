@@ -314,6 +314,7 @@ export interface PeriodoCalculado {
   ingresosDetalle: IngresoSubcuentaDetalle[]
   costosDetalle: CostoSubcuentaDetalle[]
   gastosDetalle: GastoSubcuentaDetalle[]
+  saldosCuenta: Record<string, number>
 }
 
 export interface ResultadoMotor {
@@ -846,15 +847,22 @@ function calcOBLIFINCorriente(balance: BalanceParseado) {
 // ══════════════════════════════════════════════════════════════
 
 function calcOBLIFINNC(balance: BalanceParseado) {
-  const obligFinNCTotal =
-    neg(obtenerSFPrefijo(balance, '2105', 'Subcuenta')) +
-    neg(obtenerSFPrefijo(balance, '2106', 'Subcuenta'))
-
+  // GENÉRICO: el grupo 21 completo son obligaciones financieras.
+  // Se toma TODO el grupo 21 (nivel Cuenta, 4 dígitos) y se le resta la
+  // parte corriente (211x/212x leasing). Así funciona con cualquier cliente:
+  //   · TURISMO/PIVOTE: 2105, 2106 (créditos)
+  //   · World Office:   2140 (recompra cartera), 2195 (otras obligaciones)
+  const grupo21Total = neg(obtenerSFPrefijo(balance, '21', 'Cuenta'))
+  const corriente211 = neg(obtenerSFPrefijo(balance, '211', 'Subcuenta'))
+  const corriente212 = neg(obtenerSFPrefijo(balance, '212', 'Subcuenta'))
+  const obligFinNCTotal = Math.max(0, grupo21Total - corriente211 - corriente212)
   const creditosLP: CreditoDetalle[] = balance.subcuentas
-    .filter(c =>
-      (c.codigo.startsWith('2105') || c.codigo.startsWith('2106')) &&
-      !c.esBasura && Math.abs(c.saldoFinal) > 0
-    )
+    .filter(c => {
+      const cod = String(c.codigo).replace(/\.0$/, '').trim()
+      return cod.startsWith('21') &&
+             !cod.startsWith('211') && !cod.startsWith('212') &&
+             !c.esBasura && Math.abs(c.saldoFinal) > 0
+    })
     .map(c => ({ nombre: c.nombre, codigo: c.codigo, saldoFinal: neg(c.saldoFinal) }))
 
   const oblFinDetalle = auxiliaresAgrupados(balance, '21')
@@ -1762,6 +1770,14 @@ export function procesarBalances(multi: BalancesMultiPeriodo, perfil?: PerfilCli
     const cxc        = calcCXC(balance)
     
     const inventario = calcINVENTARIO(balance)
+
+    // Mapa de saldos por cuenta (4 y 6 dígitos) para el motor de reglas
+    const saldosCuenta: Record<string, number> = {}
+    for (const c of [...balance.cuentasN3, ...balance.subcuentas]) {
+      if (c.esBasura) continue
+      const cod = String(c.codigo).replace(/\.0$/, '').trim()
+      saldosCuenta[cod] = (saldosCuenta[cod] ?? 0) + c.saldoFinal
+    }
     const efectivoTotal = caja.cajaTotal + bancos.bancosTotal
     const otrosAC = obtenerSFPrefijo(balance, '17', 'Cuenta') +
                     obtenerSFPrefijo(balance, '195', 'Subcuenta')
@@ -1887,6 +1903,7 @@ export function procesarBalances(multi: BalancesMultiPeriodo, perfil?: PerfilCli
       pasivoCorriente, pasivoNoCorriente, totalPasivo,
       patrimonio, totalPasivoMasPatrimonio,
       eriMensual, advertencias: adv,
+      saldosCuenta,
       ingresosDetalle: calcINGRESOS(balance, perfil),
       costosDetalle:   calcCOSTOS(balance),
       gastosDetalle:   calcGASTOS(balance),

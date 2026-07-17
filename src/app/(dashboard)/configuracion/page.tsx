@@ -47,7 +47,7 @@ export default async function ConfiguracionPage() {
       <EstadoSistema />
 
       {/* Gestión de usuarios */}
-      <UsuariosPanel miId={user.id} />
+      <UsuariosPanel />
 
       {/* Clientes configurados */}
       <section className="bg-card border border-border rounded-xl">

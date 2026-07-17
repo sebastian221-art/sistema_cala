@@ -61,7 +61,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     // ── 4. Generar Excel ────────────────────────────────────────────────────
     const workbook = generarTanda1(resultado)
-    const xlsxBuffer = await workbook.xlsx.writeBuffer() as Buffer
+    const xlsxBuffer = await workbook.xlsx.writeBuffer()
     const excelBase64 = Buffer.from(xlsxBuffer).toString('base64')
 
     // ── 5. Respuesta ────────────────────────────────────────────────────────

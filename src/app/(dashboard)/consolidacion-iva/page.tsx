@@ -1,42 +1,48 @@
 'use client'
 
 // src/app/(dashboard)/consolidacion-iva/page.tsx
-import { useState, useRef, useCallback } from 'react'
+// Flujo de 2 pasos: 1) subir listado → preview editable  2) generar Excel
+import { useState, useRef, useCallback, useMemo } from 'react'
 import {
-  Upload,
-  FileSpreadsheet,
-  FileArchive,
-  Download,
-  CheckCircle,
-  AlertCircle,
-  Loader2,
-  Info,
-  Calculator,
-  X,
+  Upload, FileSpreadsheet, Download, CheckCircle, AlertCircle,
+  Loader2, Info, Calculator, X, ArrowLeft,
 } from 'lucide-react'
 
-type Estado = 'idle' | 'procesando' | 'listo' | 'error'
+type Estado = 'idle' | 'analizando' | 'revision' | 'generando' | 'listo' | 'error'
 
-interface Resumen {
-  total_filas: number
-  excluidas: number
-  con_xml: number
-  asumidas: number
+interface FacturaPreview {
+  cufe: string
+  hoja: string
+  tipo: string
+  fecha: string
+  nit_proveedor: string
+  nombre_proveedor: string
+  iva_dian: number
+  total_dian: number
+  es_nc: boolean
+  tarifa: number
+  origen: string
 }
+
+const TARIFAS = [
+  { valor: 19, label: '19%' },
+  { valor: 5, label: '5%' },
+  { valor: 0, label: 'Exento' },
+]
+
+const money = (n: number) =>
+  new Intl.NumberFormat('es-CO', { maximumFractionDigits: 0 }).format(n)
 
 export default function ConsolidacionIvaPage() {
   const [listado, setListado] = useState<File | null>(null)
-  const [xmls, setXmls] = useState<File | null>(null)
   const [estado, setEstado] = useState<Estado>('idle')
   const [error, setError] = useState('')
-  const [resumen, setResumen] = useState<Resumen | null>(null)
+  const [facturas, setFacturas] = useState<FacturaPreview[]>([])
   const [excelBlob, setExcelBlob] = useState<Blob | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  const [otroValor, setOtroValor] = useState<Record<string, string>>({})
 
   const listadoRef = useRef<HTMLInputElement>(null)
-  const xmlRef = useRef<HTMLInputElement>(null)
-
-  // ─── Manejo de archivos ────────────────────────────────────────────────
 
   const setListadoFile = (file: File) => {
     if (!file.name.toLowerCase().endsWith('.xlsx')) {
@@ -46,18 +52,8 @@ export default function ConsolidacionIvaPage() {
     setListado(file)
     setEstado('idle')
     setError('')
-    setResumen(null)
+    setFacturas([])
     setExcelBlob(null)
-  }
-
-  const setXmlFile = (file: File) => {
-    const n = file.name.toLowerCase()
-    if (!n.endsWith('.zip') && !n.endsWith('.xml')) {
-      setError('Los XML deben venir en un .zip (o un .xml suelto)')
-      return
-    }
-    setXmls(file)
-    setError('')
   }
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -67,28 +63,60 @@ export default function ConsolidacionIvaPage() {
     if (file) setListadoFile(file)
   }, [])
 
-  // ─── Procesar ──────────────────────────────────────────────────────────
-
-  const procesar = async () => {
+  // ── Paso 1: subir → preview ──
+  const analizar = async () => {
     if (!listado) return
-    setEstado('procesando')
+    setEstado('analizando')
     setError('')
-    setResumen(null)
-
     try {
       const fd = new FormData()
+      fd.append('action', 'preview')
       fd.append('listado', listado)
-      if (xmls) fd.append('xmls', xmls)
+      const res = await fetch('/api/consolidacion-iva', { method: 'POST', body: fd })
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        throw new Error(j.error ?? 'No se pudo leer el listado.')
+      }
+      const data = await res.json()
+      setFacturas(data.facturas ?? [])
+      setEstado('revision')
+    } catch (e: any) {
+      setError(e?.message ?? 'Error inesperado.')
+      setEstado('error')
+    }
+  }
+
+  // ── Cambiar la tarifa de una factura ──
+  const cambiarTarifa = (cufe: string, tarifa: number) => {
+    setFacturas((prev) =>
+      prev.map((f) => (f.cufe === cufe ? { ...f, tarifa, origen: 'editado' } : f))
+    )
+  }
+
+  const aplicarOtro = (cufe: string) => {
+    const v = parseFloat(otroValor[cufe])
+    if (!isNaN(v) && v >= 0 && v <= 100) cambiarTarifa(cufe, v)
+  }
+
+  // ── Paso 2: generar Excel ──
+  const generar = async () => {
+    if (!listado) return
+    setEstado('generando')
+    setError('')
+    try {
+      const decisiones: Record<string, number> = {}
+      for (const f of facturas) decisiones[f.cufe] = f.tarifa
+
+      const fd = new FormData()
+      fd.append('action', 'generar')
+      fd.append('listado', listado)
+      fd.append('decisiones', JSON.stringify(decisiones))
 
       const res = await fetch('/api/consolidacion-iva', { method: 'POST', body: fd })
       if (!res.ok) {
         const j = await res.json().catch(() => ({}))
-        throw new Error(j.error ?? 'No se pudo procesar el archivo.')
+        throw new Error(j.error ?? 'No se pudo generar el Excel.')
       }
-
-      const r = res.headers.get('X-Resumen')
-      if (r) setResumen(JSON.parse(atob(r)))
-
       setExcelBlob(await res.blob())
       setEstado('listo')
     } catch (e: any) {
@@ -107,241 +135,278 @@ export default function ConsolidacionIvaPage() {
     URL.revokeObjectURL(url)
   }
 
-  const reiniciar = () => {
+  const reset = () => {
     setListado(null)
-    setXmls(null)
     setEstado('idle')
     setError('')
-    setResumen(null)
+    setFacturas([])
     setExcelBlob(null)
   }
 
-  // descarga automática al quedar listo
-  if (estado === 'listo' && excelBlob) {
-    // (se dispara una sola vez por el cambio de estado)
-  }
-
-  // ─── UI ──────────────────────────────────────────────────────────────
+  // Resumen de cuántas hay por tarifa
+  const resumen = useMemo(() => {
+    const r = { total: facturas.length, t19: 0, t5: 0, exento: 0, otro: 0, presuntas: 0 }
+    for (const f of facturas) {
+      if (f.tarifa === 19) r.t19++
+      else if (f.tarifa === 5) r.t5++
+      else if (f.tarifa === 0) r.exento++
+      else r.otro++
+      if (f.origen === 'presunto') r.presuntas++
+    }
+    return r
+  }, [facturas])
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6 p-6">
-      {/* Header */}
-      <div className="flex items-start gap-4">
-        <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-accent/10 text-accent">
-          <Calculator className="h-6 w-6" />
+    <div className="max-w-6xl space-y-6">
+      {/* Encabezado */}
+      <div className="flex items-start gap-3">
+        <div className="p-2 rounded-lg bg-primary/10 text-primary">
+          <Calculator className="w-5 h-5" />
         </div>
         <div>
-          <h1 className="font-display text-2xl font-bold text-foreground">
+          <h1 className="text-xl font-display font-semibold text-foreground">
             Consolidación de IVA
           </h1>
           <p className="text-sm text-muted-foreground">
-            Genera ventas, compras y el acumulado del periodo a partir del listado
-            de la DIAN, con el IVA discriminado al 19%, 5% y exento.
+            Sube el listado de la DIAN, revisa las tarifas y genera el consolidado.
           </p>
         </div>
       </div>
 
-      {/* Nota informativa */}
-      <div className="flex gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
-        <Info className="mt-0.5 h-5 w-5 flex-shrink-0 text-blue-500" />
-        <p>
-          Sube el <strong>listado de la DIAN</strong> (token dian). Para
-          discriminar el IVA de forma exacta, adjunta también los{' '}
-          <strong>XML en un .zip</strong>. Sin los XML, el sistema asume 19% y lo
-          marca en la columna <em>Origen</em>.
-        </p>
-      </div>
+      {/* ─── PASO 1: subir ─── */}
+      {(estado === 'idle' || estado === 'analizando' || estado === 'error') && (
+        <>
+          <div
+            onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={onDrop}
+            onClick={() => listadoRef.current?.click()}
+            className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-colors ${
+              isDragging ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/50'
+            }`}
+          >
+            <input
+              ref={listadoRef}
+              type="file"
+              accept=".xlsx"
+              className="hidden"
+              onChange={(e) => e.target.files?.[0] && setListadoFile(e.target.files[0])}
+            />
+            <Upload className="w-10 h-10 mx-auto text-muted-foreground mb-3" />
+            {listado ? (
+              <div className="flex items-center justify-center gap-2 text-foreground">
+                <FileSpreadsheet className="w-4 h-4 text-primary" />
+                <span className="text-sm font-medium">{listado.name}</span>
+              </div>
+            ) : (
+              <>
+                <p className="text-sm font-medium text-foreground">
+                  Arrastra el listado de la DIAN aquí
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  o haz clic para seleccionar (.xlsx del token DIAN)
+                </p>
+              </>
+            )}
+          </div>
 
-      {/* Zona de carga: listado (obligatorio) */}
-      <div
-        onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
-        onDragLeave={() => setIsDragging(false)}
-        onDrop={onDrop}
-        onClick={() => listadoRef.current?.click()}
-        className={[
-          'cursor-pointer rounded-2xl border-2 border-dashed p-8 text-center transition-colors',
-          isDragging
-            ? 'border-accent bg-accent/5'
-            : 'border-border bg-card hover:border-accent/60 hover:bg-accent/5',
-        ].join(' ')}
-      >
-        <input
-          ref={listadoRef}
-          type="file"
-          accept=".xlsx"
-          className="hidden"
-          onChange={(e) => e.target.files?.[0] && setListadoFile(e.target.files[0])}
-        />
-        {listado ? (
-          <FileChip
-            icon={<FileSpreadsheet className="h-5 w-5 text-emerald-600" />}
-            name={listado.name}
-            onRemove={(e) => { e.stopPropagation(); setListado(null); setEstado('idle') }}
-          />
-        ) : (
-          <div className="flex flex-col items-center gap-2">
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-accent/10">
-              <Upload className="h-6 w-6 text-accent" />
+          <div className="flex items-start gap-2 text-xs text-muted-foreground bg-muted/30 rounded-lg p-3">
+            <Info className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <p>
+              El sistema asume 19% por defecto. En el siguiente paso podrás revisar
+              cada factura y cambiar la tarifa de las que sean 5%, exentas u otra.
+            </p>
+          </div>
+
+          {error && (
+            <div className="flex items-center gap-2 text-sm text-red-500 bg-red-500/10 rounded-lg p-3">
+              <AlertCircle className="w-4 h-4" />
+              {error}
             </div>
-            <p className="font-medium text-foreground">
-              Arrastra el listado de la DIAN aquí
-            </p>
-            <p className="text-xs text-muted-foreground">
-              o haz clic para seleccionar — formato .xlsx
-            </p>
-          </div>
-        )}
-      </div>
+          )}
 
-      {/* Carga secundaria: XML (opcional) */}
-      <div className="flex items-center justify-between rounded-xl border border-border bg-card p-4">
-        <div className="flex items-center gap-3">
-          <FileArchive className="h-5 w-5 text-muted-foreground" />
-          <div>
-            <p className="text-sm font-medium text-foreground">
-              XML de facturas <span className="text-muted-foreground">(opcional)</span>
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {xmls ? xmls.name : 'Para discriminar IVA real — .zip'}
-            </p>
+          <button
+            onClick={analizar}
+            disabled={!listado || estado === 'analizando'}
+            className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary-light disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {estado === 'analizando' && <Loader2 className="w-4 h-4 animate-spin" />}
+            {estado === 'analizando' ? 'Analizando...' : 'Analizar facturas'}
+          </button>
+        </>
+      )}
+
+      {/* ─── PASO 2: revisión de tarifas ─── */}
+      {estado === 'revision' && (
+        <>
+          {/* Resumen */}
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+            {[
+              { label: 'Facturas', val: resumen.total, color: 'text-foreground' },
+              { label: '19%', val: resumen.t19, color: 'text-blue-500' },
+              { label: '5%', val: resumen.t5, color: 'text-green-500' },
+              { label: 'Exento', val: resumen.exento, color: 'text-amber-500' },
+              { label: 'Por revisar', val: resumen.presuntas, color: 'text-red-500' },
+            ].map((s) => (
+              <div key={s.label} className="bg-card border border-border rounded-lg p-3 text-center">
+                <p className={`text-2xl font-bold ${s.color}`}>{s.val}</p>
+                <p className="text-xs text-muted-foreground">{s.label}</p>
+              </div>
+            ))}
           </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {xmls && (
+
+          {resumen.presuntas > 0 && (
+            <div className="flex items-start gap-2 text-xs text-amber-600 bg-amber-500/10 rounded-lg p-3">
+              <Info className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <p>
+                <strong>{resumen.presuntas} facturas</strong> están asumidas al 19%.
+                Revísalas y cambia la tarifa de las que correspondan antes de generar.
+              </p>
+            </div>
+          )}
+
+          {/* Tabla editable */}
+          <div className="bg-card border border-border rounded-xl overflow-hidden">
+            <div className="overflow-x-auto max-h-[480px]">
+              <table className="w-full text-sm">
+                <thead className="bg-muted/50 sticky top-0">
+                  <tr className="text-left text-xs text-muted-foreground">
+                    <th className="px-3 py-2 font-medium">Tipo</th>
+                    <th className="px-3 py-2 font-medium">Proveedor</th>
+                    <th className="px-3 py-2 font-medium text-right">IVA DIAN</th>
+                    <th className="px-3 py-2 font-medium text-right">Total</th>
+                    <th className="px-3 py-2 font-medium text-center">Tarifa</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {facturas.map((f) => {
+                    const esOtro = ![19, 5, 0].includes(f.tarifa)
+                    return (
+                      <tr
+                        key={f.cufe}
+                        className={`hover:bg-muted/30 ${f.es_nc ? 'text-red-500' : ''}`}
+                      >
+                        <td className="px-3 py-2">
+                          <span className="text-xs">
+                            {f.hoja}
+                            {f.es_nc && ' (NC)'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2">
+                          <p className="font-medium text-foreground truncate max-w-48">
+                            {f.nombre_proveedor}
+                          </p>
+                          <p className="text-xs text-muted-foreground">{f.nit_proveedor}</p>
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">
+                          {money(f.iva_dian)}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">
+                          {money(f.total_dian)}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center justify-center gap-1">
+                            {TARIFAS.map((t) => (
+                              <button
+                                key={t.valor}
+                                onClick={() => cambiarTarifa(f.cufe, t.valor)}
+                                className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
+                                  f.tarifa === t.valor
+                                    ? 'bg-primary text-primary-foreground'
+                                    : 'bg-muted text-muted-foreground hover:bg-muted/70'
+                                }`}
+                              >
+                                {t.label}
+                              </button>
+                            ))}
+                            {/* Otro % */}
+                            <div className="flex items-center gap-1">
+                              <input
+                                type="number"
+                                min={0}
+                                max={100}
+                                placeholder="otro"
+                                value={otroValor[f.cufe] ?? (esOtro ? String(f.tarifa) : '')}
+                                onChange={(e) =>
+                                  setOtroValor((p) => ({ ...p, [f.cufe]: e.target.value }))
+                                }
+                                onBlur={() => aplicarOtro(f.cufe)}
+                                onKeyDown={(e) => e.key === 'Enter' && aplicarOtro(f.cufe)}
+                                className={`w-14 px-1.5 py-1 rounded text-xs border text-center ${
+                                  esOtro
+                                    ? 'border-primary bg-primary/10 text-primary font-medium'
+                                    : 'border-border bg-background text-foreground'
+                                }`}
+                              />
+                              <span className="text-xs text-muted-foreground">%</span>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Acciones */}
+          <div className="flex items-center gap-3">
             <button
-              onClick={() => setXmls(null)}
-              className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label="Quitar XML"
+              onClick={reset}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-lg border border-border text-foreground hover:bg-muted transition-colors text-sm"
             >
-              <X className="h-4 w-4" />
+              <ArrowLeft className="w-4 h-4" />
+              Volver
             </button>
-          )}
-          <button
-            onClick={() => xmlRef.current?.click()}
-            className="rounded-lg border border-border px-3 py-1.5 text-sm font-medium hover:bg-muted"
-          >
-            {xmls ? 'Cambiar' : 'Adjuntar'}
-          </button>
-          <input
-            ref={xmlRef}
-            type="file"
-            accept=".zip,.xml"
-            className="hidden"
-            onChange={(e) => e.target.files?.[0] && setXmlFile(e.target.files[0])}
-          />
-        </div>
-      </div>
+            <button
+              onClick={generar}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary-light transition-colors"
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              Generar consolidado
+            </button>
+          </div>
+        </>
+      )}
 
-      {/* Error */}
-      {estado === 'error' && (
-        <div className="flex gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-          <AlertCircle className="mt-0.5 h-5 w-5 flex-shrink-0 text-red-500" />
-          <p>{error}</p>
+      {/* ─── GENERANDO ─── */}
+      {estado === 'generando' && (
+        <div className="flex items-center gap-3 text-muted-foreground py-10 justify-center">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          Generando el consolidado...
         </div>
       )}
 
-      {/* Resultado */}
-      {estado === 'listo' && resumen && (
-        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-5">
-          <div className="mb-4 flex items-center gap-2 text-emerald-800">
-            <CheckCircle className="h-5 w-5" />
-            <p className="font-semibold">Consolidación generada</p>
+      {/* ─── LISTO ─── */}
+      {estado === 'listo' && (
+        <div className="bg-card border border-border rounded-xl p-8 text-center space-y-4">
+          <div className="w-14 h-14 rounded-full bg-success/10 text-success flex items-center justify-center mx-auto">
+            <CheckCircle className="w-7 h-7" />
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Stat label="Documentos" value={resumen.total_filas} />
-            <Stat label="IVA real (XML)" value={resumen.con_xml} tone="emerald" />
-            <Stat label="Asumido 19%" value={resumen.asumidas} tone="amber" />
-            <Stat label="Excluidos" value={resumen.excluidas} />
+          <div>
+            <p className="font-semibold text-foreground">Consolidado generado</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              El Excel está listo con las tarifas que confirmaste.
+            </p>
           </div>
-          <button
-            onClick={descargar}
-            className="mt-4 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
-          >
-            <Download className="h-4 w-4" />
-            Descargar Excel de nuevo
-          </button>
+          <div className="flex items-center justify-center gap-3">
+            <button
+              onClick={descargar}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground font-medium hover:bg-primary-light transition-colors"
+            >
+              <Download className="w-4 h-4" />
+              Descargar Excel
+            </button>
+            <button
+              onClick={reset}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-lg border border-border text-foreground hover:bg-muted transition-colors text-sm"
+            >
+              Nuevo consolidado
+            </button>
+          </div>
         </div>
       )}
-
-      {/* Acciones */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={procesar}
-          disabled={!listado || estado === 'procesando'}
-          className="inline-flex items-center gap-2 rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-primary-dark transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {estado === 'procesando' ? (
-            <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Procesando…
-            </>
-          ) : (
-            <>
-              <Calculator className="h-4 w-4" />
-              Generar consolidación
-            </>
-          )}
-        </button>
-        {(listado || xmls) && estado !== 'procesando' && (
-          <button
-            onClick={reiniciar}
-            className="text-sm text-muted-foreground hover:text-foreground"
-          >
-            Limpiar
-          </button>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ─── Subcomponentes ────────────────────────────────────────────────────
-
-function FileChip({
-  icon,
-  name,
-  onRemove,
-}: {
-  icon: React.ReactNode
-  name: string
-  onRemove: (e: React.MouseEvent) => void
-}) {
-  return (
-    <div className="mx-auto flex max-w-md items-center justify-between gap-3 rounded-lg border border-border bg-card px-4 py-3">
-      <div className="flex min-w-0 items-center gap-2">
-        {icon}
-        <span className="truncate text-sm font-medium text-foreground">{name}</span>
-      </div>
-      <button
-        onClick={onRemove}
-        className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-        aria-label="Quitar archivo"
-      >
-        <X className="h-4 w-4" />
-      </button>
-    </div>
-  )
-}
-
-function Stat({
-  label,
-  value,
-  tone,
-}: {
-  label: string
-  value: number
-  tone?: 'emerald' | 'amber'
-}) {
-  const color =
-    tone === 'emerald'
-      ? 'text-emerald-700'
-      : tone === 'amber'
-      ? 'text-amber-700'
-      : 'text-foreground'
-  return (
-    <div className="rounded-lg border border-border bg-card p-3 text-center">
-      <p className={`text-2xl font-bold ${color}`}>{value}</p>
-      <p className="text-xs text-muted-foreground">{label}</p>
     </div>
   )
 }

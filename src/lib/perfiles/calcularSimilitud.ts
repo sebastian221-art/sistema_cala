@@ -2,47 +2,50 @@
 // ════════════════════════════════════════════════════════════════════════
 // SCHEMA CENTRAL del sistema de perfiles + lógica de similitud.
 // El PerfilCliente es la "configuración como datos" que el motor aplica.
+//
+// TANDA 8 — MOTOR DE REGLAS:
+//   El perfil ahora lleva un array `reglas` que la IA escribe libremente.
+//   Los booleanos viejos (clasificacion.*) siguen funcionando: se traducen
+//   automáticamente a reglas. Así nada se rompe.
 // ════════════════════════════════════════════════════════════════════════
 
 import type { EstructuraCliente } from '@/lib/motor-contable/extraerEstructura'
+import type { Regla } from '@/lib/motor-contable/reglas'
 
 // ─────────────────────────────────────────────────────────────────────────
 // SCHEMA DEL PERFIL
 // ─────────────────────────────────────────────────────────────────────────
 export interface PerfilCliente {
   ingresos: {
-    mostrarAuxiliares: boolean          // ¿discriminar sub-categorías?
-    subcuentasConAuxiliar: string[]     // qué subcuentas 6d discriminar, ej ["418001"]
-    nivelDigitosAuxiliar: number        // normalmente 8
+    mostrarAuxiliares: boolean
+    subcuentasConAuxiliar: string[]
+    nivelDigitosAuxiliar: number
   }
   costos: {
-    prefijos: string[]                  // ej ["61","62","71"]
+    prefijos: string[]
     agruparPorSubcuenta: boolean
   }
   gastos: {
-    prefijos: string[]                  // ej ["51","52","53"]
+    prefijos: string[]
   }
   terceros: {
     excluirDebitoSinCredito: boolean
-    nitExtranjerosPatron: string        // ej "44444" (vacío si no aplica)
+    nitExtranjerosPatron: string
   }
   columnas: {
     mostrarAcumulado: boolean
-    mesesAnioActual: number             // normalmente 3
+    mesesAnioActual: number
     mostrarAniosAnteriores: boolean
   }
+  // ── LEGADO: booleanos de la TANDA 7 (se traducen a reglas) ──
   clasificacion: {
-    // 1355 Anticipo de impuestos: true = Cuentas por Cobrar (corriente),
-    // false = Otros Activos (no corriente) [comportamiento por defecto]
     anticipoImpuestosEnCorriente: boolean
-    // 2370 Aportes de nómina: true = se suma a Fiscales,
-    // false = va en su renglón aparte [comportamiento por defecto]
     aportesNominaEnFiscales: boolean
-    // Cuentas por pagar: true = el renglón agrupa proveedores + deudas socios
-    // (2355) + costos y gastos; false = solo muestra proveedores [por defecto]
     cxpAgrupaSociosYGastos: boolean
   }
-  notasEspeciales: string               // instrucciones del contador en texto
+  // ── TANDA 8: reglas libres que la IA escribe ──
+  reglas: Regla[]
+  notasEspeciales: string
 }
 
 // Perfil por defecto (seguro, comportamiento estándar)
@@ -73,7 +76,46 @@ export const PERFIL_DEFECTO: PerfilCliente = {
     aportesNominaEnFiscales: false,
     cxpAgrupaSociosYGastos: false,
   },
+  reglas: [],
   notasEspeciales: '',
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TRADUCTOR: perfil → reglas
+// Convierte los booleanos viejos (TANDA 7) en reglas, y les suma las
+// reglas libres que la IA haya escrito. Así conviven ambos sistemas.
+// ─────────────────────────────────────────────────────────────────────────
+export function reglasDesdePerfil(perfil?: PerfilCliente): Regla[] {
+  if (!perfil) return []
+
+  const reglas: Regla[] = []
+  const c = perfil.clasificacion
+
+  // Regla 1 (legado): el 1355 se muestra en Cuentas por Cobrar
+  if (c?.anticipoImpuestosEnCorriente) {
+    reglas.push({ tipo: 'mover', cuenta: '1355', a: 'cuentasPorCobrar' })
+  }
+
+  // Regla 2 (legado): los aportes de nómina (2370) se suman a Fiscales
+  if (c?.aportesNominaEnFiscales) {
+    reglas.push({ tipo: 'mover', cuenta: '2370', a: 'fiscales' })
+  }
+
+  // Regla 3 (legado): CxP agrupa proveedores + socios + costos y gastos
+  if (c?.cxpAgrupaSociosYGastos) {
+    reglas.push({
+      tipo: 'agrupar',
+      cuentas: ['2205', '2355', '2335'],
+      a: 'proveedores',
+    })
+  }
+
+  // Reglas libres escritas por la IA (van después, pueden refinar)
+  if (Array.isArray(perfil.reglas)) {
+    reglas.push(...perfil.reglas)
+  }
+
+  return reglas
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -82,22 +124,21 @@ export const PERFIL_DEFECTO: PerfilCliente = {
 export interface CasoTipo {
   id: string
   nombre: string
-  prefijos: string[]                    // prefijos PUC del caso
+  prefijos: string[]
   perfil_json: PerfilCliente
   usos: number
 }
 
 export interface ResultadoSimilitud {
   caso: CasoTipo
-  score: number                         // 0..1
-  razon: string                         // explicación legible
+  score: number
+  razon: string
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // SIMILITUD
-// ─────────────────────────────────────────────────────────────────────────
 // Jaccard de prefijos (70%) + coincidencia de patrón de auxiliares (30%)
-
+// ─────────────────────────────────────────────────────────────────────────
 function jaccard(a: string[], b: string[]): number {
   const setA = new Set(a)
   const setB = new Set(b)
@@ -114,7 +155,6 @@ export function calcularSimilitud(
 ): number {
   const simPrefijos = jaccard(estructura.prefijosPresentes, caso.prefijos)
 
-  // Patrón de auxiliares: ¿ambos discriminan ingresos o ninguno?
   const estDiscrimina = estructura.resumen.ingresosTienenAuxiliares
   const casoDiscrimina = caso.perfil_json.ingresos.mostrarAuxiliares
   const simPatron = estDiscrimina === casoDiscrimina ? 1 : 0
@@ -144,5 +184,5 @@ export function ordenarPorSimilitud(
   return casos
     .map(c => calcularSimilitudDetallada(estructura, c))
     .sort((a, b) => b.score - a.score)
-    .filter(r => r.score >= 0.6)   // solo sugerir si hay coincidencia razonable
+    .filter(r => r.score >= 0.6)
 }

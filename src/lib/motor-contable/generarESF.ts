@@ -34,6 +34,8 @@
  * ============================================================
  */
 
+import { renglonesESF, ETIQUETA_DE, type RenglonId } from './reglas'
+import { reglasDesdePerfil } from '@/lib/perfiles/calcularSimilitud'
 import ExcelJS from 'exceljs'
 import type { ResultadoMotor, PeriodoCalculado, EriAcumulado } from './motor'
 import type { TerceroAgrupado } from './parser' 
@@ -4287,79 +4289,55 @@ export function hojaESF(wb: ExcelJS.Workbook, r: ResultadoMotor) {
     (p.patrimonio.resultadoEjercicioAnterior ?? 0) -
     (p.patrimonio.resultadosAnteriores ?? 0)
 
-  const totalObligFin = (p: PeriodoCalculado): number =>
-    p.pasivoCorriente.obligFinCorrTotal + p.pasivoNoCorriente.obligFinNCTotal
-  const obligFinCorr = (p: PeriodoCalculado): number => totalObligFin(p) * 0.2
-  const obligFinNC   = (p: PeriodoCalculado): number => totalObligFin(p) * 0.8
+
   const v = (g: (p: PeriodoCalculado) => number) => periOrd.map(g)
 
   // TANDA 7: clasificación configurable del anticipo de impuestos (1355)
   // true  → Cuentas por Cobrar (corriente) | false → Otros Activos (no corriente)
-  const anticEnCorriente = r.perfil?.clasificacion?.anticipoImpuestosEnCorriente ?? false
+// ── MOTOR DE REGLAS ──
+  // El perfil trae reglas libres; los booleanos viejos se traducen solos.
+  const reglas = reglasDesdePerfil(r.perfil)
+  const R = (p: PeriodoCalculado) => renglonesESF(p, reglas)
+  const rv = (id: RenglonId) => v(p => R(p)[id].valor)
+  const et = (id: RenglonId) =>
+    periOrd.length ? R(periOrd[0])[id].etiqueta : ETIQUETA_DE[id]
 
-// TANDA 7 — Regla 2: aportes de nómina (2370) dentro de Fiscales
-const nominaEnFiscales = r.perfil?.clasificacion?.aportesNominaEnFiscales ?? false
-
-// TANDA 7 — Regla 3: Cuentas por Pagar agrupa proveedores + socios + costos/gastos
-const cxpAgrupado = r.perfil?.clasificacion?.cxpAgrupaSociosYGastos ?? false
-
-let f = 10
+  let f = 10
 
   // ══════════════════════════════════════════════════════════
   // ACTIVO CORRIENTE
   // ══════════════════════════════════════════════════════════
   esfRow(f, 'Corrientes', [], { bold: true }); f++
 
-  esfRow(f, 'Efectivo y Equivalentes al Efectivo',
-    v(p => p.activoCorriente.efectivoTotal),
-    { nota: 4, indent: 1 }); f++
+  esfRow(f, et('efectivo'),         rv('efectivo'),         { nota: 4, indent: 1 }); f++
+  esfRow(f, et('inversiones'),      rv('inversiones'),      { nota: 5, indent: 1 }); f++
+  esfRow(f, et('cuentasPorCobrar'), rv('cuentasPorCobrar'), { nota: 6, indent: 1 }); f++
+  esfRow(f, et('inventarios'),      rv('inventarios'),      { nota: 7, indent: 1 }); f++
 
-  esfRow(f, 'Inversiones',
-    v(p => p.activoCorriente.inversionesTotal),
-    { nota: 5, indent: 1 }); f++
-
-    esfRow(f, 'Cuentas Por Cobrar',
-      v(p => p.activoCorriente.clientesTotal + p.activoCorriente.anticiposTotal
-           + (anticEnCorriente ? p.activoCorriente.anticipoImpuestosTotal : 0)),
-      { nota: 6, indent: 1 }); f++
-
-  esfRow(f, 'Inventarios',
-    v(p => p.activoCorriente.inventarioTotal),
-    { nota: 7, indent: 1 }); f++
-
-    esfRow(f, 'Total ',
-      v(p => anticEnCorriente
-        ? p.activoCorriente.totalActivoCorriente
-        : p.activoCorriente.totalActivoCorriente - p.activoCorriente.anticipoImpuestosTotal),
-      { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
+  // Total corriente = suma de los renglones (respeta las reglas, cuadre intacto)
+  esfRow(f, 'Total ',
+    v(p => {
+      const x = R(p)
+      return x.efectivo.valor + x.inversiones.valor + x.cuentasPorCobrar.valor +
+             x.inventarios.valor + x.otrosActivosCorrientes.valor
+    }),
+    { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
 
   // ══════════════════════════════════════════════════════════
   // ACTIVO NO CORRIENTE
   // ══════════════════════════════════════════════════════════
   esfRow(f, 'No corrientes', [], { bold: true }); f++
 
-  esfRow(f, 'Propiedad Planta y Equipo',
-    v(p => p.activoNoCorriente.ppyeNeto),
+  esfRow(f, et('ppye'), rv('ppye'), { nota: 8, indent: 1 }); f++
+  esfRow(f, et('otrosActivosNoCorrientes'), rv('otrosActivosNoCorrientes'),
     { nota: 8, indent: 1 }); f++
 
-    esfRow(f, 'Otros Activos',
-      v(p =>
-        p.activoNoCorriente.intangiblesTotal +
-        p.activoNoCorriente.diferidosTotal   +
-        p.activoNoCorriente.otrosActivosNC   +
-        (anticEnCorriente ? 0 : p.activoCorriente.anticipoImpuestosTotal)
-      ),
-      { nota: 8, indent: 1 }); f++
-
-      esfRow(f, 'Total ',
-        v(p =>
-          p.activoNoCorriente.ppyeNeto              +
-          p.activoNoCorriente.intangiblesTotal       +
-          p.activoNoCorriente.diferidosTotal         +
-          p.activoNoCorriente.otrosActivosNC         +
-          (anticEnCorriente ? 0 : p.activoCorriente.anticipoImpuestosTotal)
-        ),
-        { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
+  esfRow(f, 'Total ',
+    v(p => {
+      const x = R(p)
+      return x.ppye.valor + x.otrosActivosNoCorrientes.valor
+    }),
+    { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
 
   esfRow(f, 'Total Activo',
     v(p => p.totalActivo),
@@ -4371,42 +4349,34 @@ let f = 10
   esfRow(f, 'PASIVOS', [], { bold: true, fillArgb: C.VERDE_HEADER }); f += 2
 
   esfRow(f, 'Corrientes', [], { bold: true }); f++
-  esfRow(f, 'Financieros',
-    v(p => obligFinCorr(p)), { nota: 9, indent: 1 }); f++
-  // TANDA 7 — Regla 3: si está activa, el renglón de Cuentas por Pagar agrupa
-  // proveedores (2205) + deudas con socios (2355) + costos y gastos (2335).
-  // Estas cuentas YA están en el total (cxpTotal), así que solo se hacen
-  // visibles en este renglón — el Total Pasivo no cambia y el cuadre se mantiene.
-  const cxpRenglon = (p: PeriodoCalculado): number => {
-    if (!cxpAgrupado) return p.pasivoCorriente.proveedoresTotal
-    const det = p.pasivoCorriente.cxpDetalle ?? []
-    return det
-      .filter(x => x.codigo.startsWith('2205') || x.codigo.startsWith('2355') || x.codigo.startsWith('2335'))
-      .reduce((s, x) => s + x.total, 0)
-  }
-  esfRow(f, 'Proveedores y Acreedores Comerciales',
-    v(p => cxpRenglon(p)), { nota: 10, indent: 1 }); f++
-  esfRow(f, 'Costos y Gastos Por Pagar',
-    v(p => cxpAgrupado ? 0 : p.pasivoCorriente.costosGastosPagar), { nota: 11, indent: 1 }); f++
-    esfRow(f, 'Fiscales',
-      v(p => p.pasivoCorriente.fiscalesTotal
-           + (nominaEnFiscales ? p.pasivoCorriente.aporteNomina : 0)),
-      { nota: 10, indent: 1 }); f++
-    esfRow(f, 'Por Beneficios a Empleados',
-      v(p => p.pasivoCorriente.beneficiosCorrTotal), { nota: 12, indent: 1 }); f++
-  esfRow(f, 'Otros Pasivos',
-    v(p => p.pasivoNoCorriente.otrosPasivosNCTotal), { nota: 12, indent: 1 }); f++
+ esfRow(f, et('financierosCorriente'),  rv('financierosCorriente'),  { nota: 9,  indent: 1 }); f++
+  esfRow(f, et('proveedores'),           rv('proveedores'),           { nota: 10, indent: 1 }); f++
+  esfRow(f, et('costosGastosPagar'),     rv('costosGastosPagar'),     { nota: 11, indent: 1 }); f++
+  esfRow(f, et('fiscales'),              rv('fiscales'),              { nota: 10, indent: 1 }); f++
+  esfRow(f, et('beneficiosEmpleados'),   rv('beneficiosEmpleados'),   { nota: 12, indent: 1 }); f++
+  esfRow(f, et('otrosPasivosCorriente'), rv('otrosPasivosCorriente'), { nota: 12, indent: 1 }); f++
+
+  // Total corriente = suma de los renglones (respeta las reglas)
   esfRow(f, 'Total ',
-    v(p => p.pasivoCorriente.totalPasivoCorriente),
+    v(p => {
+      const x = R(p)
+      return x.financierosCorriente.valor + x.proveedores.valor +
+             x.costosGastosPagar.valor + x.fiscales.valor +
+             x.beneficiosEmpleados.valor + x.otrosPasivosCorriente.valor
+    }),
     { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
 
   esfRow(f, 'No corrientes', [], { bold: true }); f++
-  esfRow(f, 'Financieros',
-    v(p => obligFinNC(p)), { nota: 9, indent: 1 }); f++
-  esfRow(f, 'Por Beneficios a Empleados',
-    v(p => p.pasivoNoCorriente.provisionLaboralTotal), { nota: 12, indent: 1 }); f++
+  esfRow(f, et('financierosNoCorriente'),  rv('financierosNoCorriente'),  { nota: 9,  indent: 1 }); f++
+  esfRow(f, et('beneficiosNoCorriente'),   rv('beneficiosNoCorriente'),   { nota: 12, indent: 1 }); f++
+  esfRow(f, et('otrosPasivosNoCorriente'), rv('otrosPasivosNoCorriente'), { nota: 12, indent: 1 }); f++
+
   esfRow(f, 'Total ',
-    v(p => p.pasivoNoCorriente.totalPasivoNoCorriente),
+    v(p => {
+      const x = R(p)
+      return x.financierosNoCorriente.valor + x.beneficiosNoCorriente.valor +
+             x.otrosPasivosNoCorriente.valor
+    }),
     { bold: true, fillArgb: C.AZUL_TOTAL }); f += 2
 
   esfRow(f, 'Total Pasivo',
