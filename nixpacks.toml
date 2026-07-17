@@ -1,15 +1,17 @@
-# Railway (Nixpacks) — Node + Python juntos.
-# Instala Python con pip incluido para los scripts (spawn python3).
+# Railway (Nixpacks) — Node + Python con librerías incluidas vía Nix.
+# NO usa pip (que no funciona en el Python sellado de Nix).
+# En su lugar, Nix instala python311 junto con openpyxl y lxml directamente.
 
 [phases.setup]
-nixPkgs = ['nodejs_20', 'python311', 'python311Packages.pip']
+nixPkgs = [
+  'nodejs_20',
+  'python311',
+  'python311Packages.openpyxl',
+  'python311Packages.lxml'
+]
 
 [phases.install]
-cmds = [
-  'npm ci',
-  'python3 -m ensurepip --upgrade || true',
-  'python3 -m pip install --break-system-packages -r requirements.txt'
-]
+cmds = ['npm ci']
 
 [phases.build]
 cmds = ['npm run build']
