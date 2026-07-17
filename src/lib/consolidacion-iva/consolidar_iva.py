@@ -4,7 +4,7 @@ Motor de Consolidacion de IVA (CALA) — VERSION 2, dos pasos.
 
 MODO PREVIEW:
     python3 consolidar_iva.py preview <listado.xlsx> [--tarifas <json_nit_tarifa>]
-    -> devuelve JSON con todas las facturas y su tarifa presunta.
+    -> devuelve JSON con todas las facturas, su tarifa presunta y el cliente detectado.
 
 MODO GENERAR:
     python3 consolidar_iva.py generar <listado.xlsx> <salida.xlsx> <decisiones_json>
@@ -16,6 +16,7 @@ import sys
 import io
 import json
 import unicodedata
+from collections import Counter
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -131,8 +132,30 @@ def _nom_prov(f):
     return f["nom_emi"] if f["hoja"] == "COMPRAS" else f["nom_rec"]
 
 
+def _detectar_cliente(facturas):
+    """
+    El cliente (la empresa consolidada) es el emisor en las ventas/nomina/doc
+    soporte, y el receptor en las compras. Se toma el NIT mas frecuente.
+    """
+    cont = Counter()
+    nombres = {}
+    for f in facturas:
+        if f["hoja"] == "COMPRAS":
+            nit, nom = f["nit_rec"], f["nom_rec"]
+        else:
+            nit, nom = f["nit_emi"], f["nom_emi"]
+        if nit:
+            cont[nit] += 1
+            nombres.setdefault(nit, nom)
+    if not cont:
+        return "", ""
+    nit = cont.most_common(1)[0][0]
+    return nit, nombres.get(nit, "")
+
+
 def modo_preview(listado_path, tarifas_conocidas):
     facturas = leer_facturas(listado_path)
+    cliente_nit, cliente_nombre = _detectar_cliente(facturas)
     filas = []
     for f in facturas:
         nit = _nit_prov(f)
@@ -147,7 +170,12 @@ def modo_preview(listado_path, tarifas_conocidas):
             "iva_dian": f["iva_dian"], "total_dian": f["total_dian"],
             "es_nc": f["es_nc"], "tarifa": tarifa, "origen": origen,
         })
-    return {"total": len(filas), "facturas": filas}
+    return {
+        "total": len(filas),
+        "facturas": filas,
+        "cliente_nit": cliente_nit,
+        "cliente_nombre": cliente_nombre,
+    }
 
 
 def _bases(f, tarifa):
@@ -283,7 +311,6 @@ if __name__ == "__main__":
         listado, salida, dec_path = sys.argv[2], sys.argv[3], sys.argv[4]
         with open(dec_path, encoding="utf-8") as fh:
             decisiones = json.load(fh)
-        # normalizar: las claves son CUFE, los valores tarifa (int)
         decisiones = {k: int(v) for k, v in decisiones.items()}
         res = modo_generar(listado, salida, decisiones)
         print(json.dumps(res, ensure_ascii=False, default=str))

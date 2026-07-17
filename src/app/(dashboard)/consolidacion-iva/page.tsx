@@ -2,10 +2,11 @@
 
 // src/app/(dashboard)/consolidacion-iva/page.tsx
 // Flujo de 2 pasos: 1) subir listado → preview editable  2) generar Excel
+// Recuerda por cliente la tarifa de cada tercero (tabla tarifas_cliente).
 import { useState, useRef, useCallback, useMemo } from 'react'
 import {
   Upload, FileSpreadsheet, Download, CheckCircle, AlertCircle,
-  Loader2, Info, Calculator, X, ArrowLeft,
+  Loader2, Info, Calculator, ArrowLeft, Building2, Bookmark,
 } from 'lucide-react'
 
 type Estado = 'idle' | 'analizando' | 'revision' | 'generando' | 'listo' | 'error'
@@ -41,6 +42,8 @@ export default function ConsolidacionIvaPage() {
   const [excelBlob, setExcelBlob] = useState<Blob | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [otroValor, setOtroValor] = useState<Record<string, string>>({})
+  const [clienteNit, setClienteNit] = useState('')
+  const [clienteNombre, setClienteNombre] = useState('')
 
   const listadoRef = useRef<HTMLInputElement>(null)
 
@@ -54,6 +57,8 @@ export default function ConsolidacionIvaPage() {
     setError('')
     setFacturas([])
     setExcelBlob(null)
+    setClienteNit('')
+    setClienteNombre('')
   }
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -79,6 +84,8 @@ export default function ConsolidacionIvaPage() {
       }
       const data = await res.json()
       setFacturas(data.facturas ?? [])
+      setClienteNit(data.cliente_nit ?? '')
+      setClienteNombre(data.cliente_nombre ?? '')
       setEstado('revision')
     } catch (e: any) {
       setError(e?.message ?? 'Error inesperado.')
@@ -107,10 +114,23 @@ export default function ConsolidacionIvaPage() {
       const decisiones: Record<string, number> = {}
       for (const f of facturas) decisiones[f.cufe] = f.tarifa
 
+      // Tarifa representativa por tercero (se prefiere la excepción, no el 19%)
+      const tarifasPorTercero: Record<string, number> = {}
+      for (const f of facturas) {
+        const nit = f.nit_proveedor
+        if (!nit) continue
+        const prev = tarifasPorTercero[nit]
+        if (prev === undefined || (prev === 19 && f.tarifa !== 19)) {
+          tarifasPorTercero[nit] = f.tarifa
+        }
+      }
+
       const fd = new FormData()
       fd.append('action', 'generar')
       fd.append('listado', listado)
       fd.append('decisiones', JSON.stringify(decisiones))
+      fd.append('cliente_nit', clienteNit)
+      fd.append('tarifas_tercero', JSON.stringify(tarifasPorTercero))
 
       const res = await fetch('/api/consolidacion-iva', { method: 'POST', body: fd })
       if (!res.ok) {
@@ -141,17 +161,24 @@ export default function ConsolidacionIvaPage() {
     setError('')
     setFacturas([])
     setExcelBlob(null)
+    setClienteNit('')
+    setClienteNombre('')
   }
 
   // Resumen de cuántas hay por tarifa
   const resumen = useMemo(() => {
-    const r = { total: facturas.length, t19: 0, t5: 0, exento: 0, otro: 0, presuntas: 0 }
+    const r = {
+      total: facturas.length,
+      t19: 0, t5: 0, exento: 0, otro: 0,
+      presuntas: 0, conocidas: 0,
+    }
     for (const f of facturas) {
       if (f.tarifa === 19) r.t19++
       else if (f.tarifa === 5) r.t5++
       else if (f.tarifa === 0) r.exento++
       else r.otro++
       if (f.origen === 'presunto') r.presuntas++
+      if (f.origen === 'conocido') r.conocidas++
     }
     return r
   }, [facturas])
@@ -215,6 +242,7 @@ export default function ConsolidacionIvaPage() {
             <p>
               El sistema asume 19% por defecto. En el siguiente paso podrás revisar
               cada factura y cambiar la tarifa de las que sean 5%, exentas u otra.
+              Las tarifas que confirmes quedan guardadas para ese cliente.
             </p>
           </div>
 
@@ -239,13 +267,26 @@ export default function ConsolidacionIvaPage() {
       {/* ─── PASO 2: revisión de tarifas ─── */}
       {estado === 'revision' && (
         <>
+          {/* Cliente detectado */}
+          {clienteNit && (
+            <div className="flex items-center gap-2 text-sm bg-primary/5 border border-primary/20 rounded-lg p-3">
+              <Building2 className="w-4 h-4 text-primary flex-shrink-0" />
+              <span className="text-muted-foreground">Cliente detectado:</span>
+              <span className="font-medium text-foreground">
+                {clienteNombre || 'Sin nombre'}
+              </span>
+              <span className="text-xs text-muted-foreground">NIT {clienteNit}</span>
+            </div>
+          )}
+
           {/* Resumen */}
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-6 gap-3">
             {[
               { label: 'Facturas', val: resumen.total, color: 'text-foreground' },
               { label: '19%', val: resumen.t19, color: 'text-blue-500' },
               { label: '5%', val: resumen.t5, color: 'text-green-500' },
               { label: 'Exento', val: resumen.exento, color: 'text-amber-500' },
+              { label: 'Recordadas', val: resumen.conocidas, color: 'text-violet-500' },
               { label: 'Por revisar', val: resumen.presuntas, color: 'text-red-500' },
             ].map((s) => (
               <div key={s.label} className="bg-card border border-border rounded-lg p-3 text-center">
@@ -293,9 +334,17 @@ export default function ConsolidacionIvaPage() {
                           </span>
                         </td>
                         <td className="px-3 py-2">
-                          <p className="font-medium text-foreground truncate max-w-48">
-                            {f.nombre_proveedor}
-                          </p>
+                          <div className="flex items-center gap-1.5">
+                            <p className="font-medium text-foreground truncate max-w-48">
+                              {f.nombre_proveedor}
+                            </p>
+                            {f.origen === 'conocido' && (
+                              <span className="inline-flex items-center gap-0.5 text-[10px] text-violet-500 bg-violet-500/10 rounded px-1 py-0.5">
+                                <Bookmark className="w-2.5 h-2.5" />
+                                guardada
+                              </span>
+                            )}
+                          </div>
                           <p className="text-xs text-muted-foreground">{f.nit_proveedor}</p>
                         </td>
                         <td className="px-3 py-2 text-right tabular-nums">
@@ -387,7 +436,7 @@ export default function ConsolidacionIvaPage() {
           <div>
             <p className="font-semibold text-foreground">Consolidado generado</p>
             <p className="text-sm text-muted-foreground mt-1">
-              El Excel está listo con las tarifas que confirmaste.
+              El Excel está listo. Las tarifas quedaron guardadas para este cliente.
             </p>
           </div>
           <div className="flex items-center justify-center gap-3">
