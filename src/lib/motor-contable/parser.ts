@@ -1,11 +1,11 @@
 /**
  * ============================================================
- * PARSER DE BALANCE — SIIGO + WORLD OFFICE (COLOMBIA)
+ * PARSER DE BALANCE — SIIGO + WORLD OFFICE + SIESA (COLOMBIA)
  * ============================================================
- * Versión: 5.0.0
+ * Versión: 6.0.0
  *
- * GENÉRICO: funciona para cualquier empresa colombiana en Siigo
- * O en World Office. Detecta el formato automáticamente por los
+ * GENÉRICO: funciona para cualquier empresa colombiana en Siigo,
+ * World Office O SIESA. Detecta el formato automáticamente por los
  * nombres de columna y adapta el mapeo.
  *
  * ─── FORMATO SIIGO ("Balance de prueba por tercero") ───
@@ -15,15 +15,24 @@
  *   Tercero: filas con nivel = Auxiliar/Subauxiliar.
  *
  * ─── FORMATO WORLD OFFICE ("Mayor y balances con terceros") ───
- *   Fila 1:    headers (Cuenta, Nombre cuenta, Tercero, Nombre tercero,
- *              Referencia, F. creación, F. pago, Saldo anterior,
- *              Débito, Crédito, Saldo)
+ *   Fila 1:    headers (Cuenta, Nombre cuenta, Tercero, Nombre tercero, ...)
  *   NO hay columna "Nivel" → el nivel se infiere por longitud de código.
- *   NO hay metadata de empresa/NIT/período → se infiere del nombre de
- *   archivo o se deja editable (no rompe).
  *   Tercero: filas con la columna "Tercero" con valor.
  *
- * MODO DE SIGNOS (ambos, NEGATIVO estándar Colombia):
+ * ─── FORMATO SIESA ("Balance por terceros") ───
+ *   Fila 1:    headers (Auxiliar, Desc. auxiliar, Razón social tercero movto.,
+ *              Tercero, Saldo inicial, Débitos, Créditos, Saldo final)
+ *   El CÓDIGO de cuenta está en la columna "Auxiliar". Puede venir como
+ *   código solo ("11050501") o pegado al nombre ("1105 - CAJA"): se toma
+ *   solo el número inicial.
+ *   NO hay columna "Nivel" → el nivel se infiere por longitud de código.
+ *   Tercero: filas con la columna "Tercero" (NIT) con valor; el nombre está
+ *   en "Razón social tercero movto.". El nombre de la cuenta está en
+ *   "Desc. auxiliar".
+ *   NO trae metadata de empresa/NIT/período → se infiere del nombre de
+ *   archivo o se deja editable (no rompe).
+ *
+ * MODO DE SIGNOS (los tres, NEGATIVO estándar Colombia):
  *   Clase 1 (Activo)  → SF positivo
  *   Clase 2 (Pasivo)  → SF negativo
  *   Clase 3 (Patrim.) → SF negativo
@@ -41,7 +50,7 @@ import * as XLSX from 'xlsx'
 
 export type NivelPUC = 'Clase' | 'Grupo' | 'Cuenta' | 'Subcuenta' | 'Auxiliar' | 'Subauxiliar'
 export type ModoSignos = 'POSITIVO' | 'NEGATIVO'
-export type FormatoBalance = 'SIIGO' | 'WORLD_OFFICE'
+export type FormatoBalance = 'SIIGO' | 'WORLD_OFFICE' | 'SIESA'
 
 export interface MetadataBalance {
   empresa: string
@@ -136,6 +145,15 @@ function limpiarCodigo(raw: unknown): string {
   return s.replace(/[^\d]/g, '')
 }
 
+// SIESA: el código viene en "Auxiliar", a veces solo ("11050501") y a veces
+// pegado al nombre ("1105 - CAJA") o con espacios de indentación. Se toma el
+// PRIMER bloque numérico, así el nombre (aunque tenga números) no lo contamina.
+function limpiarCodigoSiesa(raw: unknown): string {
+  if (raw == null) return ''
+  const m = String(raw).trim().match(/^(\d+)/)
+  return m ? m[1] : ''
+}
+
 function limpiarNum(raw: unknown): number {
   if (raw == null || raw === '') return 0
   const n = typeof raw === 'number' ? raw : parseFloat(String(raw).replace(/,/g, '.'))
@@ -190,7 +208,7 @@ function corregirRef(ws: XLSX.WorkSheet): XLSX.WorkSheet {
 }
 
 // ─────────────────────────────────────────────────────────────
-// DETECCIÓN DE FILA HEADER (Siigo fila 8, World Office fila 1)
+// DETECCIÓN DE FILA HEADER (Siigo fila 8, World Office / SIESA fila 1)
 // ─────────────────────────────────────────────────────────────
 function encontrarHeader(filas: unknown[][]): number {
   for (let i = 0; i < Math.min(15, filas.length); i++) {
@@ -199,17 +217,22 @@ function encontrarHeader(filas: unknown[][]): number {
       .map(v => norm(String(v)))
     // Siigo: tiene "nivel" + algo con "codigo"
     if (textos.some(t => t === 'nivel') && textos.some(t => t.includes('codigo'))) return i
+    // SIESA: "auxiliar" + "tercero" + "saldo final"
+    const tieneAux = textos.some(t => t === 'auxiliar')
+    const tieneTercero = textos.some(t => t === 'tercero')
+    const tieneSF = textos.some(t => t === 'saldo final')
+    if (tieneAux && tieneTercero && tieneSF) return i
     // World Office: "cuenta" + "nombre cuenta" + "saldo"
     const tieneCuenta = textos.some(t => t === 'cuenta')
     const tieneNombreCta = textos.some(t => t === 'nombre cuenta' || t.includes('nombre cuenta'))
     const tieneSaldo = textos.some(t => t === 'saldo' || t === 'saldo anterior')
     if (tieneCuenta && tieneNombreCta && tieneSaldo) return i
   }
-  return 0 // fallback: primera fila (World Office). Siigo cae en 7 por su propio header.
+  return 0 // fallback: primera fila (World Office / SIESA). Siigo cae en 7 por su propio header.
 }
 
 // ─────────────────────────────────────────────────────────────
-// MAPEO DE COLUMNAS (robusto, por alias — Siigo + World Office)
+// MAPEO DE COLUMNAS (robusto, por alias — Siigo + World Office + SIESA)
 // ─────────────────────────────────────────────────────────────
 interface ColMap {
   nivel?: number
@@ -242,22 +265,22 @@ function mapCols(headers: string[]): ColMap {
   return {
     nivel:    find('nivel'),
     trans:    find('transaccional'),
-    // Siigo: "codigo cuenta contable" | World Office: "cuenta"
-    codigo:   find('codigo cuenta contable', 'codigo cuenta', 'codigo', 'cuenta'),
-    // Siigo: "nombre cuenta contable" | World Office: "nombre cuenta"
-    nombre:   find('nombre cuenta contable', 'nombre cuenta', 'nombre cta'),
-    // Siigo: "identificacion" | World Office: "tercero" (el código del tercero)
+    // Siigo: "codigo cuenta contable" | World Office: "cuenta" | SIESA: "auxiliar"
+    codigo:   find('codigo cuenta contable', 'codigo cuenta', 'codigo', 'cuenta', 'auxiliar'),
+    // Siigo: "nombre cuenta contable" | World Office: "nombre cuenta" | SIESA: "desc. auxiliar"
+    nombre:   find('nombre cuenta contable', 'nombre cuenta', 'nombre cta', 'desc. auxiliar', 'desc auxiliar'),
+    // Siigo: "identificacion" | World Office / SIESA: "tercero" (el NIT del tercero)
     nit:      find('identificacion', 'nit', 'tercero'),
     sucursal: find('sucursal'),
-    // ambos: "nombre tercero"
-    tercero:  find('nombre tercero'),
-    // Siigo: "saldo inicial" | World Office: "saldo anterior"
+    // Siigo/WO: "nombre tercero" | SIESA: "razon social tercero movto."
+    tercero:  find('nombre tercero', 'razon social tercero'),
+    // Siigo: "saldo inicial" | World Office: "saldo anterior" | SIESA: "saldo inicial"
     si:       find('saldo inicial', 'saldo anterior'),
-    // Siigo: "movimiento debito" | World Office: "debito"
+    // Siigo: "movimiento debito" | World Office / SIESA: "debito(s)"
     deb:      find('movimiento debito', 'debito', 'debitos'),
-    // Siigo: "movimiento credito" | World Office: "credito"
+    // Siigo: "movimiento credito" | World Office / SIESA: "credito(s)"
     cre:      find('movimiento credito', 'credito', 'creditos'),
-    // Siigo: "saldo final" | World Office: "saldo"
+    // Siigo: "saldo final" | World Office: "saldo" | SIESA: "saldo final"
     sf:       find('saldo final', 'saldo'),
   }
 }
@@ -269,6 +292,8 @@ function detectarFormato(headers: string[]): FormatoBalance {
   const h = headers.map(norm)
   // Siigo tiene columna "Nivel" y "Transaccional"
   if (h.some(x => x === 'nivel')) return 'SIIGO'
+  // SIESA: columna "Auxiliar" (código) + "Tercero" + "Desc. auxiliar"
+  if (h.some(x => x === 'auxiliar') && h.some(x => x === 'tercero')) return 'SIESA'
   // World Office: "cuenta" + "saldo anterior"/"referencia"
   if (h.some(x => x === 'cuenta') && h.some(x => x === 'saldo anterior' || x === 'referencia')) {
     return 'WORLD_OFFICE'
@@ -299,26 +324,27 @@ function extraerMetaSiigo(filas: unknown[][], filaHeader: number) {
   return { empresa, nit, periodo, mes, anio }
 }
 
-// World Office no trae metadata en el Excel. Se infiere del nombre de archivo
-// (si se pasó) o se dejan valores por defecto editables — nunca rompe.
-function extraerMetaWorldOffice(
+// World Office y SIESA no traen metadata en el Excel. Se infiere del nombre de
+// archivo (si se pasó) o se dejan valores por defecto editables — nunca rompe.
+function extraerMetaSinEncabezado(
   filas: unknown[][],
   filaHeader: number,
-  nombreArchivo?: string
+  nombreArchivo: string | undefined,
+  etiquetaFormato: string
 ) {
   let empresa = '', nit = '', periodo = ''
 
-  // A veces World Office pone un título en las filas de arriba (si filaHeader>0)
+  // A veces hay un título en las filas de arriba (si filaHeader>0)
   for (let i = 0; i < filaHeader; i++) {
     const vals = (filas[i] ?? []).filter(v => v != null).map(v => String(v).trim()).filter(Boolean)
     for (const t of vals) {
       if (!nit && /^[\d.\-]{8,15}$/.test(t.replace(/\s/g, ''))) nit = t
-      else if (!empresa && t.length > 4 && !/^\d/.test(t) && !/mayor|balance|tercero/i.test(t)) empresa = t
+      else if (!empresa && t.length > 4 && !/^\d/.test(t) && !/mayor|balance|tercero|auxiliar/i.test(t)) empresa = t
       if (!periodo && Object.keys(MESES_ES).some(m => norm(t).includes(m))) periodo = t
     }
   }
 
-  // Inferir del nombre de archivo (ej. "Mayor_..._2026.xlsx", "..._ABRIL_2026.xlsx")
+  // Inferir del nombre de archivo (ej. "..._JUNIO_2026.xlsx")
   if (nombreArchivo) {
     const nf = norm(nombreArchivo)
     if (!periodo) {
@@ -332,7 +358,7 @@ function extraerMetaWorldOffice(
 
   const { mes, anio } = parsearPeriodo(periodo)
   return {
-    empresa: empresa || 'EMPRESA (World Office)',
+    empresa: empresa || `EMPRESA (${etiquetaFormato})`,
     nit: nit || '',
     periodo: periodo || '',
     mes: mes || 0,
@@ -425,12 +451,16 @@ export function parsearBalance(
   // Metadata según formato
   const meta = formato === 'SIIGO'
     ? extraerMetaSiigo(rawFilas, headerIdx)
-    : extraerMetaWorldOffice(rawFilas, headerIdx, nombreArchivo)
+    : extraerMetaSinEncabezado(
+        rawFilas, headerIdx, nombreArchivo,
+        formato === 'SIESA' ? 'SIESA' : 'World Office'
+      )
 
-  // En World Office la columna "Tercero" es a la vez el NIT. Para separar
+  // En World Office y SIESA la columna "Tercero" es el NIT. Para separar
   // "fila de cuenta" de "fila de tercero" usamos: si esa columna tiene valor,
-  // es una fila de tercero (y el código se mantiene, pero el nivel será Auxiliar).
+  // es una fila de tercero (nivel Auxiliar/Subauxiliar).
   const esWO = formato === 'WORLD_OFFICE'
+  const inferirPorTercero = formato === 'WORLD_OFFICE' || formato === 'SIESA'
 
   const cuentas: CuentaPUC[] = []
   let totalDeb = 0, totalCre = 0
@@ -450,13 +480,21 @@ export function parsearBalance(
     const nivelesValidos = ['clase', 'grupo', 'cuenta', 'subcuenta', 'auxiliar', 'subauxiliar']
     if (col.nivel !== undefined && nivelRaw && !nivelesValidos.includes(nivelRaw)) continue
 
-    // Código
+    // Código (SIESA usa extractor de bloque numérico inicial)
     const codigoRaw = fila[headers[col.codigo]]
-    const codigo = limpiarCodigo(codigoRaw)
+    const codigo = formato === 'SIESA' ? limpiarCodigoSiesa(codigoRaw) : limpiarCodigo(codigoRaw)
     if (!codigo || !/^\d+$/.test(codigo) || codigo.length > 12) continue
 
     // Nombre de la cuenta
-    const nombre = col.nombre !== undefined ? String(fila[headers[col.nombre]] ?? '').trim() : ''
+    let nombre = col.nombre !== undefined ? String(fila[headers[col.nombre]] ?? '').trim() : ''
+    // SIESA: las filas de subtotal (Clase/Grupo/Cuenta/Subcuenta) traen el nombre
+    // pegado en la columna del código ("1105 - CAJA") y la columna "Desc. auxiliar"
+    // vacía. Se recupera el nombre de la parte después de " - ".
+    if (formato === 'SIESA' && !nombre) {
+      const rawCod = String(codigoRaw ?? '')
+      const idx = rawCod.indexOf(' - ')
+      if (idx >= 0) nombre = rawCod.substring(idx + 3).trim()
+    }
     if (!nombre || nombre === 'nan' || nombre === 'null') continue
 
     // Valor de la columna NIT/Tercero
@@ -474,8 +512,8 @@ export function parsearBalance(
       else if (nivelRaw === 'auxiliar') nivel = 'Auxiliar'
       else if (nivelRaw === 'subauxiliar') nivel = 'Subauxiliar'
       else nivel = inferirNivel(codigo.length)
-    } else if (esWO && nitCol && nitCol !== '0') {
-      // World Office: fila con "Tercero" lleno → es un tercero (Auxiliar),
+    } else if (inferirPorTercero && nitCol && nitCol !== '0') {
+      // World Office / SIESA: fila con "Tercero" lleno → es un tercero,
       // sin importar la longitud del código de la cuenta a la que pertenece.
       nivel = codigo.length >= 8 ? 'Subauxiliar' : 'Auxiliar'
     } else {
@@ -483,20 +521,12 @@ export function parsearBalance(
       nivel = inferirNivel(codigo.length)
     }
 
-    // NIT y nombre de tercero según formato
-    let nitFinal: string | undefined
-    let nombreTerceroFinal: string | undefined
-    if (esWO) {
-      // En WO, la columna "Tercero" ES el NIT; "Nombre tercero" es el nombre
-      nitFinal = nitCol && nitCol !== '0' ? nitCol : undefined
-      nombreTerceroFinal = terceroNombre || undefined
-    } else {
-      nitFinal = nitCol && nitCol !== '0' ? nitCol : undefined
-      nombreTerceroFinal = terceroNombre || undefined
-    }
+    // NIT y nombre de tercero
+    const nitFinal = nitCol && nitCol !== '0' ? nitCol : undefined
+    const nombreTerceroFinal = terceroNombre || undefined
 
     const transRaw = col.trans !== undefined ? norm(String(fila[headers[col.trans]] ?? '')) : ''
-    const tieneMovimiento = esWO
+    const tieneMovimiento = inferirPorTercero
       ? (limpiarNum(fila[headers[col.deb!]]) !== 0 || limpiarNum(fila[headers[col.cre!]]) !== 0)
       : (transRaw === 'sí' || transRaw === 'si' || transRaw === 'yes')
 
@@ -535,8 +565,8 @@ export function parsearBalance(
     adv.push(`Balance no cuadra: débitos=${totalDeb.toFixed(0)}, créditos=${totalCre.toFixed(0)}`)
   }
   if (clases.length === 0) adv.push('No se encontraron cuentas de Clase — verificar archivo')
-  if (formato === 'WORLD_OFFICE' && !meta.mes) {
-    adv.push('World Office: no se detectó el mes en el nombre de archivo — verificar período')
+  if ((formato === 'WORLD_OFFICE' || formato === 'SIESA') && !meta.mes) {
+    adv.push(`${formato}: no se detectó el mes en el nombre de archivo — verificar período`)
   }
 
   return {
