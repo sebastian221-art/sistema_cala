@@ -50,7 +50,7 @@ import * as XLSX from 'xlsx'
 
 export type NivelPUC = 'Clase' | 'Grupo' | 'Cuenta' | 'Subcuenta' | 'Auxiliar' | 'Subauxiliar'
 export type ModoSignos = 'POSITIVO' | 'NEGATIVO'
-export type FormatoBalance = 'SIIGO' | 'WORLD_OFFICE' | 'SIESA'
+export type FormatoBalance = 'SIIGO' | 'WORLD_OFFICE' | 'SIESA' | 'SYD'
 
 export interface MetadataBalance {
   empresa: string
@@ -222,6 +222,11 @@ function encontrarHeader(filas: unknown[][]): number {
     const tieneTercero = textos.some(t => t === 'tercero')
     const tieneSF = textos.some(t => t === 'saldo final')
     if (tieneAux && tieneTercero && tieneSF) return i
+    // SYD: "codigo" + "nombre" + "debito actual"/"debito anterior"
+    const tieneCodigo = textos.some(t => t === 'codigo')
+    const tieneNombre = textos.some(t => t === 'nombre')
+    const tieneDebAct = textos.some(t => t === 'debito actual' || t === 'debito anterior')
+    if (tieneCodigo && tieneNombre && tieneDebAct) return i
     // World Office: "cuenta" + "nombre cuenta" + "saldo"
     const tieneCuenta = textos.some(t => t === 'cuenta')
     const tieneNombreCta = textos.some(t => t === 'nombre cuenta' || t.includes('nombre cuenta'))
@@ -246,6 +251,11 @@ interface ColMap {
   deb?: number
   cre?: number
   sf?: number
+  // SYD: saldos partidos en débito/crédito (anterior = inicial, actual = final)
+  debAnt?: number
+  credAnt?: number
+  debAct?: number
+  credAct?: number
 }
 
 function mapCols(headers: string[]): ColMap {
@@ -267,8 +277,8 @@ function mapCols(headers: string[]): ColMap {
     trans:    find('transaccional'),
     // Siigo: "codigo cuenta contable" | World Office: "cuenta" | SIESA: "auxiliar"
     codigo:   find('codigo cuenta contable', 'codigo cuenta', 'codigo', 'cuenta', 'auxiliar'),
-    // Siigo: "nombre cuenta contable" | World Office: "nombre cuenta" | SIESA: "desc. auxiliar"
-    nombre:   find('nombre cuenta contable', 'nombre cuenta', 'nombre cta', 'desc. auxiliar', 'desc auxiliar'),
+    // Siigo: "nombre cuenta contable" | WO: "nombre cuenta" | SIESA: "desc. auxiliar" | SYD: "nombre"
+    nombre:   find('nombre cuenta contable', 'nombre cuenta', 'nombre cta', 'desc. auxiliar', 'desc auxiliar', 'nombre'),
     // Siigo: "identificacion" | World Office / SIESA: "tercero" (el NIT del tercero)
     nit:      find('identificacion', 'nit', 'tercero'),
     sucursal: find('sucursal'),
@@ -276,12 +286,17 @@ function mapCols(headers: string[]): ColMap {
     tercero:  find('nombre tercero', 'razon social tercero'),
     // Siigo: "saldo inicial" | World Office: "saldo anterior" | SIESA: "saldo inicial"
     si:       find('saldo inicial', 'saldo anterior'),
-    // Siigo: "movimiento debito" | World Office / SIESA: "debito(s)"
+    // Siigo: "movimiento debito" | World Office / SIESA: "debito(s)" | SYD: "debito"
     deb:      find('movimiento debito', 'debito', 'debitos'),
-    // Siigo: "movimiento credito" | World Office / SIESA: "credito(s)"
+    // Siigo: "movimiento credito" | World Office / SIESA: "credito(s)" | SYD: "credito"
     cre:      find('movimiento credito', 'credito', 'creditos'),
     // Siigo: "saldo final" | World Office: "saldo" | SIESA: "saldo final"
     sf:       find('saldo final', 'saldo'),
+    // SYD: saldos partidos débito/crédito
+    debAnt:   find('debito anterior', 'debitos anterior'),
+    credAnt:  find('credito anterior', 'creditos anterior'),
+    debAct:   find('debito actual', 'debitos actual'),
+    credAct:  find('credito actual', 'creditos actual'),
   }
 }
 
@@ -294,6 +309,10 @@ function detectarFormato(headers: string[]): FormatoBalance {
   if (h.some(x => x === 'nivel')) return 'SIIGO'
   // SIESA: columna "Auxiliar" (código) + "Tercero" + "Desc. auxiliar"
   if (h.some(x => x === 'auxiliar') && h.some(x => x === 'tercero')) return 'SIESA'
+  // SYD ("Balance Detallado"): "codigo" + "debito actual" (saldos partidos deb/cred)
+  if (h.some(x => x === 'codigo') && h.some(x => x === 'debito actual' || x === 'debitos actual')) {
+    return 'SYD'
+  }
   // World Office: "cuenta" + "saldo anterior"/"referencia"
   if (h.some(x => x === 'cuenta') && h.some(x => x === 'saldo anterior' || x === 'referencia')) {
     return 'WORLD_OFFICE'
@@ -317,6 +336,28 @@ function extraerMetaSiigo(filas: unknown[][], filaHeader: number) {
       periodo = t; continue
     }
     if (!empresa && t.length > 4 && !/balance de prueba/i.test(t) && !/^\d/.test(t)) {
+      empresa = t
+    }
+  }
+  const { mes, anio } = parsearPeriodo(periodo)
+  return { empresa, nit, periodo, mes, anio }
+}
+
+// SYD trae metadata en las filas de arriba: empresa, "Nit. 901437355-4",
+// "Balance Detallado a Enero 31 de 2024".
+function extraerMetaSyd(filas: unknown[][], filaHeader: number) {
+  let empresa = '', nit = '', periodo = ''
+  for (let i = 0; i < filaHeader; i++) {
+    const vals = (filas[i] ?? []).filter(v => v != null).map(v => String(v).trim()).filter(Boolean)
+    if (!vals.length) continue
+    const t = vals[0]
+    // NIT: puede venir como "Nit. 901437355-4" → extraer los dígitos/guion
+    const mNit = t.match(/nit[.:\s]*([\d.\-]{6,15})/i)
+    if (!nit && mNit) { nit = mNit[1]; continue }
+    if (!nit && /^[\d.\-]{8,15}$/.test(t.replace(/\s/g, ''))) { nit = t; continue }
+    // Período: "Balance Detallado a Enero 31 de 2024"
+    if (!periodo && Object.keys(MESES_ES).some(m => norm(t).includes(m))) { periodo = t; continue }
+    if (!empresa && t.length > 4 && !/^\d/.test(t) && !/balance|detallado|^nit/i.test(norm(t))) {
       empresa = t
     }
   }
@@ -370,11 +411,14 @@ function extraerMetaSinEncabezado(
 // DETECCIÓN MODO DE SIGNOS
 // ─────────────────────────────────────────────────────────────
 function detectarModo(cuentas: CuentaPUC[]): ModoSignos {
-  for (const clase of ['4', '2']) {
+  // Pasivo (2) y Patrimonio (3) son el indicador más confiable del signo:
+  // siempre son de naturaleza crédito. Ingresos (4) a veces viene invertido
+  // en algunos exports (ej. SYD), así que se revisa de último.
+  for (const clase of ['2', '3', '4']) {
     const c = cuentas.find(x => x.nivel === 'Clase' && x.codigo === clase && Math.abs(x.saldoFinal) > 100_000)
     if (c) return c.saldoFinal < 0 ? 'NEGATIVO' : 'POSITIVO'
   }
-  for (const g of ['41', '22', '42']) {
+  for (const g of ['22', '42', '41']) {
     const c = cuentas.find(x => x.nivel === 'Grupo' && x.codigo === g && Math.abs(x.saldoFinal) > 100_000)
     if (c) return c.saldoFinal < 0 ? 'NEGATIVO' : 'POSITIVO'
   }
@@ -441,7 +485,8 @@ export function parsearBalance(
       `Encabezados detectados: ${headers.join(', ')}`
     )
   }
-  if (col.sf === undefined) {
+  // SYD no tiene "saldo final" único: se calcula (Débito Actual − Crédito Actual).
+  if (col.sf === undefined && !(formato === 'SYD' && col.debAct !== undefined)) {
     throw new Error(
       `No se encontró la columna de saldo final. ` +
       `Encabezados detectados: ${headers.join(', ')}`
@@ -451,6 +496,8 @@ export function parsearBalance(
   // Metadata según formato
   const meta = formato === 'SIIGO'
     ? extraerMetaSiigo(rawFilas, headerIdx)
+    : formato === 'SYD'
+    ? extraerMetaSyd(rawFilas, headerIdx)
     : extraerMetaSinEncabezado(
         rawFilas, headerIdx, nombreArchivo,
         formato === 'SIESA' ? 'SIESA' : 'World Office'
@@ -465,6 +512,62 @@ export function parsearBalance(
   const cuentas: CuentaPUC[] = []
   let totalDeb = 0, totalCre = 0
 
+  // ── SYD: la columna "Código" mezcla el código de cuenta (PUC) y el NIT del
+  // tercero. Las cuentas tienen longitud 1/2/4/6 (o 8 si continúa la subcuenta);
+  // lo demás son terceros, que se asocian POSICIONALMENTE a la última cuenta o
+  // subcuenta impresa arriba. Los saldos vienen partidos en débito/crédito:
+  //   saldo inicial = Débito Anterior − Crédito Anterior
+  //   saldo final   = Débito Actual   − Crédito Actual
+  if (formato === 'SYD') {
+    const num = (fila: Record<string, unknown>, i?: number) =>
+      i !== undefined ? limpiarNum(fila[headers[i]]) : 0
+    let parent = '' // última cuenta/subcuenta (len 4 o 6) para colgar terceros
+    for (const fila of datos) {
+      const codigo = limpiarCodigo(fila[headers[col.codigo]])
+      if (!codigo || !/^\d+$/.test(codigo) || codigo.length > 15) continue
+      const nombre = col.nombre !== undefined ? String(fila[headers[col.nombre]] ?? '').trim() : ''
+      if (!nombre || nombre === 'nan' || nombre === 'null') continue
+
+      const saldoInicial     = num(fila, col.debAnt) - num(fila, col.credAnt)
+      const movimientoDebito  = num(fila, col.deb)
+      const movimientoCredito = num(fila, col.cre)
+      const saldoFinal        = num(fila, col.debAct) - num(fila, col.credAct)
+
+      const L = codigo.length
+      const esCuenta =
+        L === 1 || L === 2 || L === 4 || L === 6 ||
+        (L === 8 && parent !== '' && codigo.startsWith(parent.substring(0, 6)))
+
+      if (esCuenta) {
+        if (L === 4 || L === 6) parent = codigo
+        const nivel = inferirNivel(L)
+        if (L === 1) { totalDeb += num(fila, col.debAct); totalCre += num(fila, col.credAct) }
+        cuentas.push({
+          codigo, nombre, nivel,
+          nivelNumerico: NIVEL_NUM[nivel.toLowerCase()] ?? 3,
+          codigoPadre: codigoPadre(codigo, nivel),
+          saldoInicial, movimientoDebito, movimientoCredito, saldoFinal,
+          nit: undefined, nombreTercero: undefined, sucursal: undefined,
+          tieneMovimiento: movimientoDebito !== 0 || movimientoCredito !== 0,
+          esBasura: CODIGOS_BASURA.has(codigo),
+        })
+      } else {
+        // Tercero: su "código" ES el NIT. Se cuelga bajo la subcuenta 'parent'.
+        const codCuenta = parent || codigo
+        cuentas.push({
+          codigo: codCuenta, nombre, nivel: 'Auxiliar',
+          nivelNumerico: 5,
+          codigoPadre: codCuenta.substring(0, 6),
+          saldoInicial, movimientoDebito, movimientoCredito, saldoFinal,
+          nit: codigo, nombreTercero: nombre, sucursal: undefined,
+          tieneMovimiento: movimientoDebito !== 0 || movimientoCredito !== 0,
+          esBasura: false,
+        })
+      }
+    }
+    // Diferencia de 1-2 pesos = redondeo de la fuente, no descuadre real.
+    if (Math.abs(totalDeb - totalCre) < 2) totalCre = totalDeb
+  } else
   for (const fila of datos) {
     const prim = norm(String(fila[headers[0]] ?? ''))
 
