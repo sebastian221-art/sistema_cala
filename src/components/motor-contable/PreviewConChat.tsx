@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
-import type { ResultadoAPI } from '@/app/(dashboard)/motor-contable/page'
+import type { ResultadoAPI, ResultadoGeneracion } from '@/app/(dashboard)/motor-contable/page'
 import type { EstructuraCliente } from '@/lib/motor-contable/extraerEstructura'
 import type { PerfilCliente } from '@/lib/perfiles/calcularSimilitud'
 
@@ -32,8 +32,9 @@ interface Props {
   empresa:     string
   nit:         string
   prefijos:    string[]
-  // Regenera el Excel con un perfil corregido (lo provee la página)
-  onRegenerar: (perfilCorregido: PerfilCliente) => Promise<ResultadoAPI | null>
+  // Regenera el Excel con un perfil corregido (lo provee la página).
+  // Devuelve { ok, data } o { ok:false, error } con el motivo real del fallo.
+  onRegenerar: (perfilCorregido: PerfilCliente) => Promise<ResultadoGeneracion>
   // Guarda el perfil definitivo
   onConfirmar: (perfilFinal: PerfilCliente) => Promise<void>
 }
@@ -132,15 +133,23 @@ export function PreviewConChat({
       const perfilCorregido: PerfilCliente = data.perfil
 
       // 2. Regenerar el Excel con el perfil corregido
-      const nuevoResultado = await onRegenerar(perfilCorregido)
-      if (!nuevoResultado) {
-        setMensajes(prev => [...prev, { rol: 'sistema', texto: 'Apliqué la corrección al perfil pero hubo un problema regenerando el Excel.' }])
+      const gen = await onRegenerar(perfilCorregido)
+      if (!gen.ok) {
+        // Se muestra el MOTIVO REAL (antes se escondía) y se conserva el
+        // Excel anterior: 'resultado' no se sobreescribe, sigue descargable.
+        setMensajes(prev => [...prev, {
+          rol: 'sistema',
+          texto:
+            `Apliqué la corrección al perfil, pero el motor no pudo regenerar el Excel.\n` +
+            `Motivo: ${gen.error}\n` +
+            `El estado financiero anterior sigue disponible para descargar.`,
+        }])
         setPerfil(perfilCorregido)
         return
       }
 
       setPerfil(perfilCorregido)
-      setResultado(nuevoResultado)
+      setResultado(gen.data)
       setMensajes(prev => [...prev, {
         rol: 'sistema',
         texto: 'Listo, apliqué el cambio y regeneré el estado financiero. Revisa el resumen y descarga el Excel para confirmar que quedó bien.',

@@ -42,6 +42,12 @@ export interface ResultadoAPI {
   advertencias: string[]; excel_base64: string
 }
 
+// Resultado de generar/regenerar el Excel: en caso de fallo lleva el error
+// REAL (no se esconde), para poder mostrarlo en el chat de corrección.
+export type ResultadoGeneracion =
+  | { ok: true; data: ResultadoAPI }
+  | { ok: false; error: string }
+
 // Datos que se llevan del paso 1 al paso 2
 interface DatosEstructura {
   empresa: string
@@ -97,14 +103,20 @@ export default function MotorContablePage() {
     if (!datos) return
     setPerfilActivo(perfil)
     const r = await generarExcel(datos.archivos, perfil)
-    if (r) {
-      setResultado(r)
+    if (r.ok) {
+      setResultado(r.data)
       setStep('preview')
+    } else {
+      toast.error(r.error)
     }
   }
 
   // ── Generar Excel llamando al motor con el perfil ──────────────────────
-  const generarExcel = async (archivos: File[], perfil: PerfilCliente): Promise<ResultadoAPI | null> => {
+  // Devuelve el resultado O el error real (ya no lo esconde en un toast).
+  const generarExcel = async (
+    archivos: File[],
+    perfil: PerfilCliente,
+  ): Promise<ResultadoGeneracion> => {
     try {
       const fd = new FormData()
       fd.append('balance', archivos[0])
@@ -115,21 +127,29 @@ export default function MotorContablePage() {
       fd.append('perfil_json', JSON.stringify(perfil))
 
       const res = await fetch('/api/motor-contable', { method: 'POST', body: fd })
-      const data = await res.json()
-      if (!res.ok || !data.ok) {
-        toast.error(data.error ?? 'Error generando el estado financiero')
-        return null
+
+      // Puede que la respuesta no sea JSON (ej. timeout / 502 de Railway)
+      let data: (ResultadoAPI & { error?: string }) | null = null
+      try { data = await res.json() } catch { data = null }
+
+      if (!res.ok || !data?.ok) {
+        const error = data?.error ?? `El motor respondió con error (código ${res.status}).`
+        return { ok: false, error }
       }
-      return data as ResultadoAPI
-    } catch {
-      toast.error('Error de conexión con el motor')
-      return null
+      return { ok: true, data: data as ResultadoAPI }
+    } catch (e) {
+      return {
+        ok: false,
+        error: e instanceof Error ? e.message : 'Error de conexión con el motor.',
+      }
     }
   }
 
   // ── Regenerar (desde el chat de corrección) ────────────────────────────
-  const handleRegenerar = async (perfilCorregido: PerfilCliente): Promise<ResultadoAPI | null> => {
-    if (!datos) return null
+  const handleRegenerar = async (
+    perfilCorregido: PerfilCliente,
+  ): Promise<ResultadoGeneracion> => {
+    if (!datos) return { ok: false, error: 'No hay balances cargados para regenerar.' }
     setPerfilActivo(perfilCorregido)
     return await generarExcel(datos.archivos, perfilCorregido)
   }
