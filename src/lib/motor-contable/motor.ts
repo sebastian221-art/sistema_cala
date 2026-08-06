@@ -1003,12 +1003,13 @@ function calcFISCALES(balance: BalanceParseado) {
 
   // ── APORTES DE NÓMINA (2370xx) ────────────────────────────
   const aporteEPS     = neg(obtenerSF(balance, '237005'))
-  const aporteARL     = neg(obtenerSF(balance, '237006'))
+  const aporteARL     = neg(obtenerSF(balance, '237006')) + neg(obtenerSF(balance, '237020'))
   const aporteICBF    = neg(obtenerSF(balance, '237010'))
   // 237045 = Fondos (VEGA) | 238030 = Fondos cesantías/pensiones (PIVOTE → acreedores varios)
-const aportePension =
+  const aportePension =
   neg(obtenerSF(balance, '237045')) +
-  neg(obtenerSF(balance, '238030'))
+  neg(obtenerSF(balance, '238030')) +
+  neg(obtenerSF(balance, '237015'))
   const aporteNomina  = aporteEPS + aporteARL + aporteICBF + aportePension
   const nominaTotal   = reteTotal + icaRetenido + aporteNomina
 
