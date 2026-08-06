@@ -123,7 +123,7 @@ export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: 
     bloqueSubRows.push(filaSub)
   }
 
-  // ── BLOQUE 2: Beneficios a Empleados (25xx sin 2510 + provisiones 26xx) ──
+  // ── BLOQUE 2: Beneficios a Empleados (clase 25, INCLUYE 2510) ──
   {
     const filaSub = fila; fila++
     const filasSuma: number[] = []
@@ -131,20 +131,32 @@ export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: 
     for (const p of r.periodos) for (const it of (p.pasivoCorriente.beneficiosDetalle ?? [])) if (!benefUnion.has(it.codigo)) benefUnion.set(it.codigo, it.nombre)
     for (const [cod, nombre] of [...benefUnion.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       writeRow(fila, nombre, p => getCorr(p, 'beneficiosDetalle', cod), p => getCorr(p, 'beneficiosDetalle', cod), { brd: bDashedTop, indent: true })
-      if (!cod.startsWith('2510')) filasSuma.push(fila) // 2510 se EXCLUYE del subtotal (get2510)
-      fila++
+      filasSuma.push(fila); fila++ // 2510 AHORA se incluye
     }
-    const provUnion = new Map<string, string>()
-    for (const p of r.periodos) for (const it of (p.pasivoNoCorriente.provisionDetalle ?? [])) if (!provUnion.has(it.codigo)) provUnion.set(it.codigo, it.nombre)
-    for (const [cod, nombre] of [...provUnion.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      writeRow(fila, nombre, p => getNC(p, 'provisionDetalle', cod), p => getNC(p, 'provisionDetalle', cod), { brd: bDashedTop, indent: true })
-      filasSuma.push(fila); fila++
-    }
-    const resBenef = (p: PeriodoCalculado) => (p.pasivoCorriente.beneficiosCorrTotal + p.pasivoNoCorriente.provisionLaboralTotal - get2510(p)) || null
+    const resBenef = (p: PeriodoCalculado) => p.pasivoCorriente.beneficiosCorrTotal || null
     if (filasSuma.length > 0) writeFormula(filaSub, 'Beneficios a Empleados', (l) => filasSuma.map(fr => `${l}${fr}`).join(','), resBenef, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
     else writeRow(filaSub, 'Beneficios a Empleados', resBenef, resBenef, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
     bloqueSubRows.push(filaSub)
     fila++ // separador
+  }
+
+  // ── BLOQUE 2b: Pasivos Estimados y Provisiones (clase 26 - X TERCERO) ──
+  {
+    const provUnion = new Map<string, string>()
+    for (const p of r.periodos) for (const it of (p.pasivoNoCorriente.provisionDetalle ?? [])) if (!provUnion.has(it.codigo)) provUnion.set(it.codigo, it.nombre)
+    if (provUnion.size > 0) {
+      const filaSub = fila; fila++
+      const filasProv: number[] = []
+      for (const [cod, nombre] of [...provUnion.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        writeRow(fila, nombre, p => getNC(p, 'provisionDetalle', cod), p => getNC(p, 'provisionDetalle', cod), { brd: bDashedTop, indent: true })
+        filasProv.push(fila); fila++
+      }
+      const resProv = (p: PeriodoCalculado) => p.pasivoNoCorriente.provisionLaboralTotal || null
+      if (filasProv.length > 0) writeFormula(filaSub, 'Pasivos Estimados y Provisiones', (l) => filasProv.map(fr => `${l}${fr}`).join(','), resProv, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
+      else writeRow(filaSub, 'Pasivos Estimados y Provisiones', resProv, resProv, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
+      bloqueSubRows.push(filaSub)
+      fila++ // separador
+    }
   }
 
   // ── BLOQUE 3: Retenciones y Aportes de Nómina (EPS+ARP+Cajas+Pensiones) ──
@@ -199,7 +211,8 @@ export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: 
   // ── TOTAL "Otros Pasivos" (fila 9) = SUMA de los 4 subtotales de bloque ──
   const totalOP = (p: PeriodoCalculado) =>
     (p.pasivoCorriente.acreedoresVariosTotal ?? 0) +
-    (p.pasivoCorriente.beneficiosCorrTotal + p.pasivoNoCorriente.provisionLaboralTotal - get2510(p)) +
+    p.pasivoCorriente.beneficiosCorrTotal +
+    p.pasivoNoCorriente.provisionLaboralTotal +
     p.pasivoCorriente.aporteNomina +
     ((p.pasivoNoCorriente.otrosPasivos28Detalle ?? []).reduce((s, x) => s + x.total, 0))
   writeFormula(9, ' Otros Pasivos ',

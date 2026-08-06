@@ -85,6 +85,7 @@ export interface ActivoCorriente {
   anticOtros: number
   anticImpuestosDetalle: ItemDetalle[]
   otrosDeudoresTotal: number
+  otrosDeudoresDetalle: { codigo: string; nombre: string; total: number; terceros: TerceroAgrupado[] }[]
   cxcTotal: number
   tercerosCxc: TerceroAgrupado[]
    anticiposDetalle: AnticipoCuentaDetalle[]
@@ -1820,6 +1821,7 @@ export function procesarBalances(multi: BalancesMultiPeriodo, perfil?: PerfilCli
       anticOtros:              cxc.anticOtros,
       anticImpuestosDetalle:   cxc.anticImpuestosDetalle,
       otrosDeudoresTotal:      cxc.otrosDeudoresTotal,
+      otrosDeudoresDetalle:    cxc.otrosDeudoresDetalle,
       cxcTotal:                cxc.cxcTotal,
       tercerosCxc:             cxc.tercerosCxc,
       tercerosAnticipios:      cxc.tercerosAnticipios,
