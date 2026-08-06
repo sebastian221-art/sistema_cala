@@ -618,10 +618,16 @@ function calcCXC(balance: BalanceParseado) {
   const anticICA        = obtenerSF(balance, '135518')
   const anticOtros = Math.max(
     0,
-    obtenerSFPrefijo(balance, '1355', 'Subcuenta') - anticRenta - anticReteFuente - anticICA
+    obtenerSFPrefijo(balance, '1355', 'Cuenta') - anticRenta - anticReteFuente - anticICA
   )
   const anticipoImpuestosTotal = anticRenta + anticReteFuente + anticICA + anticOtros
-  const anticImpuestosDetalle  = subcuentasComoDetalle(balance, '1355')
+  const codigos6Anticipos = new Set(subcuentasComoDetalle(balance, '1355').map(x => x.codigo))
+  const huerfanas1355 = (balance.auxiliares ?? [])
+    .filter(a => String(a.codigo).startsWith('1355') && String(a.codigo).replace(/\.0$/,'').length === 8
+      && !a.esBasura && Math.abs(a.saldoFinal) > 0)
+    .filter(a => !codigos6Anticipos.has(String(a.codigo).slice(0, 6)))
+    .map(a => ({ nombre: a.nombre, codigo: String(a.codigo), valor: a.saldoFinal }))
+  const anticImpuestosDetalle = [...subcuentasComoDetalle(balance, '1355'), ...huerfanas1355]
 
   const grupo13Total = obtenerSFPrefijo(balance, '13', 'Cuenta')
   const otrosDeudoresTotal = Math.max(
@@ -651,6 +657,17 @@ function calcCXC(balance: BalanceParseado) {
     })
 
   const tercerosAnticipios = anticiposDetalle.flatMap(sc => sc.terceros)
+  const otrosDeudoresDetalle = balance.subcuentas
+    .filter(c => {
+      const cod = String(c.codigo).replace(/\.0$/, '').trim()
+      return cod.startsWith('13') && !c.esBasura && Math.abs(c.saldoFinal) > 0
+        && !cod.startsWith('1305') && !cod.startsWith('1306')
+        && !cod.startsWith('133')  && !cod.startsWith('1355')
+    })
+    .map(c => {
+      const cod = String(c.codigo).replace(/\.0$/, '').trim()
+      return { codigo: cod, nombre: c.nombre, total: c.saldoFinal, terceros: obtenerTercerosPrefijo(balance, cod) }
+    })
 
   return {
     clientesTotal, anticiposTotal,
@@ -658,6 +675,7 @@ function calcCXC(balance: BalanceParseado) {
     anticImpuestosDetalle,
     otrosDeudoresTotal, cxcTotal, tercerosCxc,
     tercerosAnticipios, anticiposDetalle,
+    otrosDeudoresDetalle,
   }
 }
 
@@ -1002,14 +1020,13 @@ function calcFISCALES(balance: BalanceParseado) {
     .map(c => ({ nombre: c.nombre, codigo: normCod(c), valor: neg(c.saldoFinal) }))
 
   // ── APORTES DE NÓMINA (2370xx) ────────────────────────────
-  const aporteEPS     = neg(obtenerSF(balance, '237005'))
-  const aporteARL     = neg(obtenerSF(balance, '237006')) + neg(obtenerSF(balance, '237020'))
-  const aporteICBF    = neg(obtenerSF(balance, '237010'))
-  // 237045 = Fondos (VEGA) | 238030 = Fondos cesantías/pensiones (PIVOTE → acreedores varios)
+  const aporteEPS     = neg(obtenerSFPrefijo(balance, '237005', 'Subcuenta'))
+  const aporteARL     = neg(obtenerSFPrefijo(balance, '237006', 'Subcuenta')) + neg(obtenerSFPrefijo(balance, '237020', 'Subcuenta'))
+  const aporteICBF    = neg(obtenerSFPrefijo(balance, '237010', 'Subcuenta'))
   const aportePension =
-  neg(obtenerSF(balance, '237045')) +
-  neg(obtenerSF(balance, '238030')) +
-  neg(obtenerSF(balance, '237015'))
+    neg(obtenerSFPrefijo(balance, '237045', 'Subcuenta')) +
+    neg(obtenerSFPrefijo(balance, '238030', 'Subcuenta')) +
+    neg(obtenerSFPrefijo(balance, '237015', 'Subcuenta'))
   const aporteNomina  = aporteEPS + aporteARL + aporteICBF + aportePension
   const nominaTotal   = reteTotal + icaRetenido + aporteNomina
 
@@ -1408,7 +1425,7 @@ function calcINGRESOS(
 function calcCOSTOS(balance: BalanceParseado): CostoSubcuentaDetalle[] {
   const result: CostoSubcuentaDetalle[] = []
 
-  const PREFIJOS = ['61', '62', '71']
+  const PREFIJOS = ['61', '62', '7']
 
   // ── Paso 1: subcuentas de 6 dígitos en balance.subcuentas ──
   const sc6 = balance.subcuentas.filter(c => {

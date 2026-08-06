@@ -2,7 +2,7 @@
 // ─────────────────────────────────────────────────────────────
 // NOTA: CXC (Cuentas Por Cobrar)  (migrada a Nivel B)
 // Arial; columnas DINÁMICAS (colMap). Estructura de 3 niveles:
-//   TOTAL (fila 10) = Clientes + Anticipos
+//   TOTAL (fila 10) = Clientes + Anticipos + Otros Deudores
 //     Clientes Nac. y Exterior = SUMA(clientes terceros)
 //     Anticipos y Avances      = SUMA(subcuentas de anticipos)
 //       cada subcuenta          = SUMA(sus terceros)
@@ -200,10 +200,34 @@ export function hojaCXC(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroC
     f++
   }
 
-  // ── TOTAL "Cuentas Por Cobrar" (fila 10) = Clientes + Anticipos ──
+  // ── Otros Deudores (1360/1370/1380 - antes escondidos en el total) ──
+  const otrosDeud = ult?.activoCorriente.otrosDeudoresDetalle ?? []
+  let otrosDeudRow = 0
+  if (otrosDeud.length > 0) {
+    otrosDeudRow = f; f++
+    const iniOD = f
+    for (const sc of otrosDeud) {
+      writeRow(f, toNombrePropio(sc.nombre), idx.map(i => {
+        const pd = todosOrd[i]; if (!pd) return null
+        const per = r.periodos.find(x => x.mes === pd.mes && x.anio === pd.anio); if (!per) return null
+        return per.activoCorriente.otrosDeudoresDetalle?.find(x => x.codigo === sc.codigo)?.total || null
+      }), { brd: bDashedTop, indent: '   ' }); f++
+    }
+    const finOD = f - 1
+    writeFormula(otrosDeudRow, 'Otros Deudores',
+      (letra) => finOD >= iniOD ? `${letra}${iniOD}:${letra}${finOD}` : '',
+      idx.map(i => snap(i, p => p.activoCorriente.otrosDeudoresTotal)),
+      { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
+    f++
+  }
+
+  // ── TOTAL "Cuentas Por Cobrar" (fila 10) = Clientes + Anticipos + Otros Deudores ──
   writeFormula(10, 'Cuentas Por Cobrar',
-    (letra) => `${letra}${clientesSubRow},${letra}${anticiposSubRow}`,
-    idx.map(i => snap(i, p => p.activoCorriente.clientesTotal + p.activoCorriente.anticiposTotal)),
+    (letra) => otrosDeudRow > 0
+      ? `${letra}${clientesSubRow},${letra}${anticiposSubRow},${letra}${otrosDeudRow}`
+      : `${letra}${clientesSubRow},${letra}${anticiposSubRow}`,
+    idx.map(i => snap(i, p => p.activoCorriente.clientesTotal + p.activoCorriente.anticiposTotal
+      + (otrosDeud.length > 0 ? p.activoCorriente.otrosDeudoresTotal : 0))),
     { bold: true, fillColor: AZUL_H, brd: bDblTop },
     (letra, slot) => { const p = todosOrd[slot]; if (p) reg?.publicar(`cxc:${p.anio}-${p.mes}`, 'CXC', `${letra}10`) })
 }
