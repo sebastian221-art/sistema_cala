@@ -1225,7 +1225,7 @@ function calcERIMENSUAL(periodos: BalanceParseado[], idx: number): EriMensual {
   //   6210 De Materias Primas en lugar de 61xx Costo de ventas
   const costoVentas     = varMesPrefijo(periodos, idx, '61', 'Cuenta')
                         + varMesPrefijo(periodos, idx, '62', 'Cuenta')
-  const costoProduccion = varMesPrefijo(periodos, idx, '71', 'Cuenta')
+  const costoProduccion = varMesPrefijo(periodos, idx, '7', 'Cuenta')
   const costoTotal      = costoVentas + costoProduccion
  
   const utilidadBruta = ingresosOperacionales - costoTotal

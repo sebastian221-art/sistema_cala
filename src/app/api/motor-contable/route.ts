@@ -7,7 +7,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { parsearBalancesMultiples } from '@/lib/motor-contable/parser'
 import { procesarBalances } from '@/lib/motor-contable/motor'
-import { generarTanda1 } from '@/lib/motor-contable/generarESF'
+import { generarTanda1 } from '@/lib/motor-contable/esf'
 import type { PerfilCliente } from '@/lib/perfiles/calcularSimilitud'
 
 export const runtime     = 'nodejs'
