@@ -1,13 +1,13 @@
 'use client'
-// src/components/motor-contable/UploadPanel.tsx v5.0
-// CAMBIO: ya NO genera el Excel directamente. Sube los balances,
-// llama a /api/motor-contable/estructura para extraer la estructura,
-// y pasa los datos + archivos al paso de perfil.
+// src/components/motor-contable/UploadPanel.tsx v6.0
+// CAMBIO v6: si el balance no trae NIT/empresa (caso SIESA), pide esos datos
+// a la contadora antes de continuar, y los manda al backend. Así el cliente
+// se guarda igual que con Siigo/World Office.
 
 import { useState, useRef, useCallback } from 'react'
 import {
   Upload, FileSpreadsheet, X, ChevronRight,
-  Loader2, AlertTriangle, Plus, Layers,
+  Loader2, AlertTriangle, Plus, Layers, Building2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -29,6 +29,12 @@ export function UploadPanel({ onEstructura }: Props) {
   const [dragging, setDragging] = useState(false)
   const [loading,  setLoading]  = useState(false)
   const [warns,    setWarns]    = useState<string[]>([])
+
+  // ── v6: estado para pedir NIT/empresa cuando el balance no los trae ──
+  const [pideDatos,     setPideDatos]     = useState(false)
+  const [empresaManual, setEmpresaManual] = useState('')
+  const [nitManual,     setNitManual]     = useState('')
+  const [dataPendiente, setDataPendiente] = useState<any>(null)
 
   const refPrincipal = useRef<HTMLInputElement>(null)
   const refAdicional = useRef<HTMLInputElement>(null)
@@ -73,20 +79,28 @@ export function UploadPanel({ onEstructura }: Props) {
     setFiles(prev => prev.filter((_, i) => i !== idx))
   }
 
-  // ── Procesar: extraer estructura (NO genera Excel todavía) ─────────────
+  // ── Arma el FormData (reutilizable) ──
+  const buildFormData = (conManuales: boolean) => {
+    const fd = new FormData()
+    fd.append('balance', files[0])
+    const adicionales = files.slice(1)
+    adicionales.forEach((f, i) => fd.append(`balance_adicional_${i}`, f))
+    if (adicionales.length > 0) fd.append('num_adicionales', String(adicionales.length))
+    if (conManuales) {
+      fd.append('nit_manual', nitManual.trim())
+      fd.append('empresa_manual', empresaManual.trim())
+    }
+    return fd
+  }
+
+  // ── Procesar: extraer estructura ──
   const handleProcess = async () => {
     if (files.length === 0) return
     setLoading(true)
     setWarns([])
 
     try {
-      const fd = new FormData()
-      fd.append('balance', files[0])
-      const adicionales = files.slice(1)
-      adicionales.forEach((f, i) => fd.append(`balance_adicional_${i}`, f))
-      if (adicionales.length > 0) fd.append('num_adicionales', String(adicionales.length))
-
-      const res  = await fetch('/api/motor-contable/estructura', { method: 'POST', body: fd })
+      const res  = await fetch('/api/motor-contable/estructura', { method: 'POST', body: buildFormData(false) })
       const data = await res.json()
 
       if (!res.ok || !data.ok) {
@@ -97,8 +111,18 @@ export function UploadPanel({ onEstructura }: Props) {
       }
 
       setWarns(data.advertencias ?? [])
-      toast.success(`Balance leído — ${data.empresa}`)
 
+      // v6: ¿el balance no trajo NIT/empresa? (SIESA) → pedir a la contadora
+      if (data.requiereDatos) {
+        setDataPendiente(data)
+        setEmpresaManual(data.empresaGenerica ? '' : (data.empresa ?? ''))
+        setNitManual(data.sinNit ? '' : (data.nit ?? ''))
+        setPideDatos(true)
+        toast.info('Este balance no trae NIT. Complétalo para continuar.')
+        return
+      }
+
+      toast.success(`Balance leído — ${data.empresa}`)
       onEstructura({
         empresa:    data.empresa,
         nit:        data.nit,
@@ -115,8 +139,95 @@ export function UploadPanel({ onEstructura }: Props) {
     }
   }
 
+  // ── v6: continuar tras escribir NIT/empresa manualmente ──
+  const handleConfirmarDatos = async () => {
+    if (nitManual.trim().length < 6 || empresaManual.trim().length === 0) return
+    setLoading(true)
+    try {
+      // Re-llamar con los datos manuales para que la respuesta ya venga completa
+      const res  = await fetch('/api/motor-contable/estructura', { method: 'POST', body: buildFormData(true) })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        toast.error(data.error ?? 'Error al leer el balance')
+        return
+      }
+      toast.success(`Balance leído — ${data.empresa}`)
+      onEstructura({
+        empresa:    data.empresa || empresaManual.trim(),
+        nit:        data.nit     || nitManual.trim(),
+        estructura: data.estructura ?? dataPendiente?.estructura,
+        archivos:   files,
+      })
+    } catch {
+      toast.error('Error de conexión')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const archivoPrincipal = files[0] ?? null
   const archivosExtra    = files.slice(1)
+  const nitValido = nitManual.trim().length >= 6
+  const datosOk   = nitValido && empresaManual.trim().length > 0
+
+  // ── v6: pantalla de completar NIT/empresa ──
+  if (pideDatos) {
+    return (
+      <div className="space-y-4">
+        <div className="rounded-2xl border border-amber-300 bg-amber-50 dark:bg-amber-500/5 p-4 space-y-3">
+          <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
+            <Building2 className="w-5 h-5" />
+            <p className="font-semibold">Completa los datos del cliente</p>
+          </div>
+          <p className="text-sm text-muted-foreground">
+            Este balance (formato SIESA) no incluye el NIT ni el nombre de la empresa.
+            Escríbelos para poder guardar el cliente.
+          </p>
+
+          <label className="block text-sm font-medium text-foreground">
+            Nombre de la empresa
+            <input
+              type="text"
+              value={empresaManual}
+              onChange={e => setEmpresaManual(e.target.value)}
+              placeholder="Ej: FASHION BRANDS GROUP S.A.S."
+              className="mt-1 w-full px-3 py-2 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+            />
+          </label>
+
+          <label className="block text-sm font-medium text-foreground">
+            NIT del cliente <span className="text-red-500">*</span>
+            <input
+              type="text"
+              value={nitManual}
+              onChange={e => setNitManual(e.target.value)}
+              placeholder="Ej: 901437355-4"
+              className="mt-1 w-full px-3 py-2 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+            />
+            {!nitValido && nitManual.length > 0 && (
+              <span className="text-xs text-red-500">El NIT parece muy corto.</span>
+            )}
+          </label>
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={() => { setPideDatos(false); setDataPendiente(null) }}
+            className="px-4 py-3 rounded-xl border border-border text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          >
+            Volver
+          </button>
+          <button
+            onClick={handleConfirmarDatos}
+            disabled={!datosOk || loading}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary text-primary-foreground rounded-xl font-semibold hover:bg-primary-light transition-colors disabled:opacity-50"
+          >
+            {loading ? (<><Loader2 className="w-4 h-4 animate-spin" /> Procesando...</>) : (<>Confirmar y continuar <ChevronRight className="w-4 h-4" /></>)}
+          </button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-4">

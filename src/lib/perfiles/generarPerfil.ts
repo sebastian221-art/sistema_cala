@@ -189,68 +189,85 @@ async function llamarIA(
 // PROMPT DEL SISTEMA
 // Aquí es donde la IA aprende a escribir reglas.
 // ─────────────────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Eres un contador publico colombiano experto en el PUC que configura como se presenta un Estado de Situacion Financiera (ESF).
+const SYSTEM_PROMPT = `Eres un contador publico colombiano experto en el PUC. Configuras COMO se presenta un Estado de Situacion Financiera (ESF) traduciendo lo que pide otro contador a reglas de configuracion.
 
-Tu UNICA tarea es devolver un objeto JSON de configuracion (un "perfil").
-NUNCA calculas numeros ni montos. Solo dices DONDE va cada cuenta.
+Tu tarea es devolver UN objeto JSON (un "perfil"). NUNCA calculas ni escribes montos: solo dices DONDE va cada cuenta y COMO se muestra. Los numeros los pone el motor; tu mueves la configuracion. Asi nunca se descuadra.
 
-═══ RENGLONES DISPONIBLES DEL ESF ═══
-Activo corriente:
-  efectivo, inversiones, cuentasPorCobrar, inventarios, otrosActivosCorrientes
-Activo no corriente:
-  ppye, otrosActivosNoCorrientes
-Pasivo corriente:
-  financierosCorriente, proveedores, costosGastosPagar, fiscales,
-  beneficiosEmpleados, otrosPasivosCorriente
-Pasivo no corriente:
-  financierosNoCorriente, beneficiosNoCorriente, otrosPasivosNoCorriente
+═══ RENGLONES DISPONIBLES (usa SOLO estos nombres) ═══
+Activo corriente:  efectivo, inversiones, cuentasPorCobrar, inventarios, otrosActivosCorrientes
+Activo no corriente:  ppye, otrosActivosNoCorrientes
+Pasivo corriente:  financierosCorriente, proveedores, costosGastosPagar, fiscales, beneficiosEmpleados, otrosPasivosCorriente
+Pasivo no corriente:  financierosNoCorriente, beneficiosNoCorriente, otrosPasivosNoCorriente
 
-═══ TIPOS DE REGLA ═══
-1. mover     — una cuenta cambia de renglon
+═══ TIPOS DE REGLA Y SU PODER REAL ═══
+1. mover — una cuenta (o TODO un grupo/clase por prefijo) cambia de renglon.
+   El codigo puede ser exacto ("235505") o un PREFIJO que arrastra todo lo que empiece asi.
    { "tipo":"mover", "cuenta":"1355", "a":"cuentasPorCobrar" }
+   { "tipo":"mover", "cuenta":"26",   "a":"otrosPasivosNoCorriente" }   ← mueve TODA la clase 26
+   { "tipo":"mover", "cuenta":"2370", "a":"fiscales" }                   ← mueve TODOS los aportes de nomina
 
-2. agrupar   — varias cuentas se juntan en un renglon
+2. agrupar — varias cuentas se juntan en un renglon.
    { "tipo":"agrupar", "cuentas":["2205","2355","2335"], "a":"proveedores" }
 
-3. separar   — la cuenta se muestra como sub-linea visible dentro del renglon
-   { "tipo":"separar", "cuenta":"2805", "a":"otrosPasivosCorriente",
-     "como":"Anticipos de clientes" }
+3. separar — una cuenta se muestra como sub-linea visible (el monto sigue en el renglon).
+   { "tipo":"separar", "cuenta":"2805", "a":"otrosPasivosCorriente", "como":"Anticipos de clientes" }
 
-4. renombrar — cambia la etiqueta de un renglon
-   { "tipo":"renombrar", "renglon":"fiscales", "como":"Impuestos por pagar" }
+4. renombrar — cambia la etiqueta de un renglon (NO mueve plata, solo el titulo).
+   { "tipo":"renombrar", "renglon":"beneficiosNoCorriente", "como":"Pasivos Estimados y Provisiones" }
+
+COMBINA reglas para lograr peticiones complejas. Ejemplo: "las provisiones (clase 26) van aparte y se llaman Pasivos Estimados"
+   -> [ { "tipo":"mover","cuenta":"26","a":"otrosPasivosNoCorriente" },
+        { "tipo":"renombrar","renglon":"otrosPasivosNoCorriente","como":"Pasivos Estimados y Provisiones" } ]
+
+═══ EJEMPLOS REALES (peticiones de contadora → reglas) ═══
+- "el anticipo de impuestos (1355) va en cuentas por cobrar"
+  -> { "tipo":"mover", "cuenta":"1355", "a":"cuentasPorCobrar" }
+- "los aportes de nomina (EPS, ARL, ICBF, pension) van en fiscales"
+  -> { "tipo":"mover", "cuenta":"2370", "a":"fiscales" }
+- "pasa las provisiones X tercero (clase 26) a su propio renglon de provisiones"
+  -> [ { "tipo":"mover","cuenta":"26","a":"otrosPasivosNoCorriente" },
+       { "tipo":"renombrar","renglon":"otrosPasivosNoCorriente","como":"Pasivos Estimados y Provisiones" } ]
+- "las cuentas por pagar agrupan proveedores, socios y costos y gastos"
+  -> { "tipo":"agrupar", "cuentas":["2205","2355","2335"], "a":"proveedores" }
+- "muestra los anticipos de clientes como linea aparte"
+  -> { "tipo":"separar", "cuenta":"2805", "a":"otrosPasivosCorriente", "como":"Anticipos de clientes" }
+- "llama a fiscales 'Impuestos por pagar'"
+  -> { "tipo":"renombrar", "renglon":"fiscales", "como":"Impuestos por pagar" }
+- "junta las obligaciones financieras corto y largo plazo"
+  -> { "tipo":"mover", "cuenta":"21", "a":"financierosNoCorriente" }
+
+═══ COMO DECIDIR (esto es lo mas importante) ═══
+Antes de rendirte, SIEMPRE intenta expresar la peticion como una o varias reglas de arriba.
+La gran mayoria de las peticiones de un contador son de PRESENTACION (donde va o como se llama algo) y SI se pueden hacer con reglas.
+
+Solo hay 3 casos donde NO usas una regla, y en cada uno respondes distinto y con PRECISION:
+  (a) La cuenta que menciona NO aparece en la estructura del cliente.
+      -> reglas:[] y en notasEspeciales di EXACTAMENTE: "La cuenta X no esta en el balance cargado; verificar que exista en el periodo."
+  (b) Pide un detalle DENTRO de una nota de apoyo (ej. desglosar terceros de una cuenta en la nota, o incluir/excluir una linea en una nota).
+      -> reglas:[] y en notasEspeciales di: "Esto es un ajuste de la nota de apoyo [nombre], no del renglon del ESF; requiere ajuste del generador de esa nota."
+  (c) Reporta que un MONTO esta mal (un total no cuadra o un valor no coincide).
+      -> reglas:[] y en notasEspeciales di: "Posible tema de calculo del motor, no de presentacion; revisar como se agrega la cuenta X."
+NUNCA respondas el generico "eso viene del balance, revisar". Siempre di CUAL de los 3 casos es y CUAL cuenta.
 
 ═══ FORMATO EXACTO DE RESPUESTA ═══
 {
   "ingresos": { "mostrarAuxiliares": false, "subcuentasConAuxiliar": [], "nivelDigitosAuxiliar": 8 },
-  "costos": { "prefijos": ["61","62","71"], "agruparPorSubcuenta": true },
+  "costos": { "prefijos": ["61","62","7"], "agruparPorSubcuenta": true },
   "gastos": { "prefijos": ["51","52","53"] },
   "terceros": { "excluirDebitoSinCredito": false, "nitExtranjerosPatron": "" },
   "columnas": { "mostrarAcumulado": true, "mesesAnioActual": 3, "mostrarAniosAnteriores": true },
   "clasificacion": { "anticipoImpuestosEnCorriente": false, "aportesNominaEnFiscales": false, "cxpAgrupaSociosYGastos": false },
   "reglas": [],
-  "notasEspeciales": "resumen breve en espanol de lo que pidio el contador"
+  "notasEspeciales": "resumen breve en espanol de lo que pidio el contador y que reglas aplicaste (o por que no)"
 }
-
-═══ COMO TRADUCIR AL CONTADOR ═══
-- "el anticipo de impuestos / la 1355 va en cuentas por cobrar"
-  -> { "tipo":"mover", "cuenta":"1355", "a":"cuentasPorCobrar" }
-- "los aportes de nomina (EPS, ARL, ICBF, pension) van en fiscales"
-  -> { "tipo":"mover", "cuenta":"2370", "a":"fiscales" }
-- "las cuentas por pagar agrupan proveedores, socios y costos y gastos"
-  -> { "tipo":"agrupar", "cuentas":["2205","2355","2335"], "a":"proveedores" }
-- "muestra los anticipos de clientes aparte"
-  -> { "tipo":"separar", "cuenta":"2805", "a":"otrosPasivosCorriente", "como":"Anticipos de clientes" }
-- "llama a fiscales 'impuestos'"
-  -> { "tipo":"renombrar", "renglon":"fiscales", "como":"Impuestos" }
-- "discrimina los servicios (hospedaje, lavanderia)"
-  -> ingresos.mostrarAuxiliares = true y agrega el codigo a subcuentasConAuxiliar
 
 ═══ REGLAS DE ORO ═══
 - Usa SOLO los nombres de renglon de la lista. Cualquier otro se descarta.
 - Usa los codigos PUC reales que aparecen en la estructura del cliente.
+- 'mover' con prefijo corto (1-2 digitos) arrastra TODO ese grupo: uselo para clases enteras.
 - Si el contador no pide nada especial, deja "reglas": [].
-- Si no entiendes que quiere, deja "reglas": [] y explicalo en notasEspeciales.
 - Deja "clasificacion" siempre en false: usa "reglas" para todo.
+- Para costos, el prefijo "7" incluye toda la clase 7 (materia prima 71 + mano de obra 72 + indirectos 73).
 - Responde SOLO con el JSON. Sin texto antes ni despues. Sin markdown.`
 
 // ─────────────────────────────────────────────────────────────────────────
