@@ -15,8 +15,37 @@ import type { ResultadoMotor, PeriodoCalculado } from '../motor'
 import type { RegistroCeldas } from './_registro'
 type ItemDetalle = { codigo: string; nombre: string; valor: number }
 import { C, FMT_PESOS, solid, font } from './_shared'
+import { aplicarReglasNota, soloReglasNota, type ReglaNota } from '../reglasNota'
 
 export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroCeldas) {
+  // ── Reglas de nota para OTROS PASIVOS (editables por la contadora vía IA) ──
+  // Se aplican con el CANDADO DE CUADRE: incluir/excluir/desglosar/renombrar.
+  const reglasNota: ReglaNota[] = soloReglasNota((r as any).perfil?.reglas ?? [])
+  const ultRN = r.periodos[r.periodos.length - 1]
+  // Detalle base de beneficios (clase 25) del último período, para correr el candado
+  const detalleBaseBenef = (ultRN?.pasivoCorriente.beneficiosDetalle ?? []).map((x: any) => ({
+    codigo: String(x.codigo), nombre: x.nombre, valor: x.valor,
+  }))
+  // Fuente para 'desglosarEnNota': subcuentas de clase 25/26 por prefijo
+  const fuentePrefijoBenef = (pref: string) => {
+    const todas = [
+      ...(ultRN?.pasivoCorriente.beneficiosDetalle ?? []),
+      ...(ultRN?.pasivoNoCorriente.provisionDetalle ?? []),
+    ]
+    return todas.filter((x: any) => String(x.codigo).startsWith(pref))
+      .map((x: any) => ({ codigo: String(x.codigo), nombre: x.nombre, valor: x.valor }))
+  }
+  const rnBenef = aplicarReglasNota('OTROS PASIVOS', detalleBaseBenef,
+    ultRN?.pasivoCorriente.beneficiosCorrTotal ?? 0, reglasNota, fuentePrefijoBenef)
+  // Mapa código→nombre efectivo (con renombrados aplicados)
+  const nombreEfectivo = (cod: string, nombreBase: string): string => {
+    const l = rnBenef.detalle.find(x => cod.startsWith(x.codigo) || x.codigo.startsWith(cod))
+    return l ? l.nombre : nombreBase
+  }
+  // Reportar al resultado las reglas que el candado rechazó (para que la IA las explique)
+  if (rnBenef.rechazadas.length > 0 && Array.isArray((r as any).advertencias)) {
+    for (const rz of rnBenef.rechazadas) (r as any).advertencias.push('⚠ ' + rz.motivo)
+  }
   const ws = wb.addWorksheet('OTROS PASIVOS')
   ws.showGridLines = false
 
@@ -130,8 +159,8 @@ export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: 
     const benefUnion = new Map<string, string>()
     for (const p of r.periodos) for (const it of (p.pasivoCorriente.beneficiosDetalle ?? [])) if (!benefUnion.has(it.codigo)) benefUnion.set(it.codigo, it.nombre)
     for (const [cod, nombre] of [...benefUnion.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      writeRow(fila, nombre, p => getCorr(p, 'beneficiosDetalle', cod), p => getCorr(p, 'beneficiosDetalle', cod), { brd: bDashedTop, indent: true })
-      filasSuma.push(fila); fila++ // 2510 AHORA se incluye
+      writeRow(fila, nombreEfectivo(cod, nombre), p => getCorr(p, 'beneficiosDetalle', cod), p => getCorr(p, 'beneficiosDetalle', cod), { brd: bDashedTop, indent: true })
+      filasSuma.push(fila); fila++
     }
     const resBenef = (p: PeriodoCalculado) => p.pasivoCorriente.beneficiosCorrTotal || null
     if (filasSuma.length > 0) writeFormula(filaSub, 'Beneficios a Empleados', (l) => filasSuma.map(fr => `${l}${fr}`).join(','), resBenef, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
@@ -148,7 +177,7 @@ export function hojaOTROSPASIVOS(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: 
       const filaSub = fila; fila++
       const filasProv: number[] = []
       for (const [cod, nombre] of [...provUnion.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-        writeRow(fila, nombre, p => getNC(p, 'provisionDetalle', cod), p => getNC(p, 'provisionDetalle', cod), { brd: bDashedTop, indent: true })
+        writeRow(fila, nombreEfectivo(cod, nombre), p => getNC(p, 'provisionDetalle', cod), p => getNC(p, 'provisionDetalle', cod), { brd: bDashedTop, indent: true })
         filasProv.push(fila); fila++
       }
       const resProv = (p: PeriodoCalculado) => p.pasivoNoCorriente.provisionLaboralTotal || null

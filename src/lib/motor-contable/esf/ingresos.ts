@@ -10,8 +10,22 @@ import ExcelJS from 'exceljs'
 import type { ResultadoMotor, PeriodoCalculado } from '../motor'
 import type { RegistroCeldas } from './_registro'
 import { C, FMT_PESOS, solid as fill, font } from './_shared'
+import { aplicarReglasNota, soloReglasNota, type ReglaNota } from '../reglasNota'
 
 export function hojaINGRESOS(wb: ExcelJS.Workbook, r: ResultadoMotor, _reg?: RegistroCeldas) {
+  // ── Reglas de nota con CANDADO DE CUADRE (editables por la contadora vía IA) ──
+  const reglasNota: ReglaNota[] = soloReglasNota((r as any).perfil?.reglas ?? [])
+  const ultRN = r.periodos[r.periodos.length - 1]
+  const detalleBaseRN = ((ultRN as any)?.ingresosDetalle ?? []).map((x: any) => ({ codigo: String(x.codigo), nombre: x.nombre, valor: x.valor }))
+  const fuentePrefijoRN = (pref: string) => detalleBaseRN.filter((x: any) => String(x.codigo).startsWith(pref))
+  const rnNota = aplicarReglasNota('INGRESOS', detalleBaseRN, (ultRN as any)?.eriMensual.ingresosTotal ?? 0, reglasNota, fuentePrefijoRN)
+  const nombreEfectivo = (cod: string, nombreBase: string): string => {
+    const l = rnNota.detalle.find(x => cod.startsWith(x.codigo) || x.codigo.startsWith(cod)); return l ? l.nombre : nombreBase
+  }
+  if (rnNota.rechazadas.length > 0 && Array.isArray((r as any).advertencias)) {
+    for (const rz of rnNota.rechazadas) (r as any).advertencias.push('⚠ ' + rz.motivo)
+  }
+
   const ws = wb.addWorksheet('INGRESOS')
   ws.showGridLines = false
   const NAVY = C.AZUL_TOTAL, AZUL_H = 'FFD9E1F2', GRIS_ITEM = C.GRIS_SUBTOTAL, NEGRO = C.NEGRO, BLANC = C.BLANCO, ROJO = 'FFFF0000'

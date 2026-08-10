@@ -9,8 +9,22 @@ import ExcelJS from 'exceljs'
 import type { ResultadoMotor, PeriodoCalculado } from '../motor'
 import type { RegistroCeldas } from './_registro'
 import { C, FMT_PESOS, solid, font as fnt, alnC, alnL, alnR, bordeThin as bThin } from './_shared'
+import { aplicarReglasNota, soloReglasNota, type ReglaNota } from '../reglasNota'
 
 export function hojaINVERSIONES(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroCeldas) {
+  // ── Reglas de nota con CANDADO DE CUADRE (editables por la contadora vía IA) ──
+  const reglasNota: ReglaNota[] = soloReglasNota((r as any).perfil?.reglas ?? [])
+  const ultRN = r.periodos[r.periodos.length - 1]
+  const detalleBaseRN = ((ultRN as any)?.activoCorriente.inversionesDetalle ?? []).map((x: any) => ({ codigo: String(x.codigo), nombre: x.nombre, valor: x.valor }))
+  const fuentePrefijoRN = (pref: string) => detalleBaseRN.filter((x: any) => String(x.codigo).startsWith(pref))
+  const rnNota = aplicarReglasNota('INVERSIONES', detalleBaseRN, (ultRN as any)?.activoCorriente.inversionesTotal ?? 0, reglasNota, fuentePrefijoRN)
+  const nombreEfectivo = (cod: string, nombreBase: string): string => {
+    const l = rnNota.detalle.find(x => cod.startsWith(x.codigo) || x.codigo.startsWith(cod)); return l ? l.nombre : nombreBase
+  }
+  if (rnNota.rechazadas.length > 0 && Array.isArray((r as any).advertencias)) {
+    for (const rz of rnNota.rechazadas) (r as any).advertencias.push('⚠ ' + rz.motivo)
+  }
+
   const ws = wb.addWorksheet('INVERSIONES')
   ws.showGridLines = false
 

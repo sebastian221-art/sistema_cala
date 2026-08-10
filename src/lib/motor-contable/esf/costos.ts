@@ -9,8 +9,23 @@ import ExcelJS from 'exceljs'
 import type { ResultadoMotor, PeriodoCalculado } from '../motor'
 import type { RegistroCeldas } from './_registro'
 import { C, FMT_PESOS, solid as fill, font } from './_shared'
+import { aplicarReglasNota, soloReglasNota, type ReglaNota } from '../reglasNota'
 
 export function hojaCOSTOS(wb: ExcelJS.Workbook, r: ResultadoMotor, _reg?: RegistroCeldas) {
+  // ── Reglas de nota con CANDADO DE CUADRE (editables por la contadora vía IA) ──
+  const reglasNota: ReglaNota[] = soloReglasNota((r as any).perfil?.reglas ?? [])
+  const ultRN = r.periodos[r.periodos.length - 1]
+  const detalleBaseRN = ((ultRN as any)?.costosDetalle ?? []).map((x: any) => ({ codigo: String(x.codigo ?? x.numero ?? ''), nombre: x.nombre ?? x.numero ?? '', valor: x.valor ?? x.total ?? x.totalSaldoFinal ?? 0 }))
+  const fuentePrefijoRN = (pref: string) => detalleBaseRN.filter((x: any) => String(x.codigo).startsWith(pref))
+  const rnNota = aplicarReglasNota('COSTOS', detalleBaseRN, ((ultRN as any)?.costosDetalle ?? []).reduce((s:number,x:any)=>s+(x.total??x.valor??0),0), reglasNota, fuentePrefijoRN)
+  const nombreEfectivo = (cod: string, nombreBase: string): string => {
+    const l = rnNota.detalle.find(x => cod.startsWith(x.codigo) || x.codigo.startsWith(cod)); return l ? l.nombre : nombreBase
+  }
+  void nombreEfectivo;
+  if (rnNota.rechazadas.length > 0 && Array.isArray((r as any).advertencias)) {
+    for (const rz of rnNota.rechazadas) (r as any).advertencias.push('⚠ ' + rz.motivo)
+  }
+
   const anioHoja = r.periodos[r.periodos.length - 1]?.anio ?? new Date().getFullYear()
   const ws = wb.addWorksheet(`COSTOS ${anioHoja}`)
   ws.showGridLines = false
