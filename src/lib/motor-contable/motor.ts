@@ -630,7 +630,31 @@ function calcCXC(balance: BalanceParseado) {
       && !a.esBasura && Math.abs(a.saldoFinal) > 0)
     .filter(a => !codigos6Anticipos.has(String(a.codigo).slice(0, 6)))
     .map(a => ({ nombre: a.nombre, codigo: String(a.codigo), valor: a.saldoFinal }))
-  const anticImpuestosDetalle = [...subcuentasComoDetalle(balance, '1355'), ...huerfanas1355]
+  // Desglosar cada subcuenta 1355 en sus auxiliares de 8 díg cuando hay 2+
+  // (corrección contadora VEGA: 135515 → 1% / Ventas / Otras).
+  // Los auxiliares suman el total de la subcuenta → NO descuadra.
+  const anticImpuestosDetalle: ItemDetalle[] = []
+  for (const sub of subcuentasComoDetalle(balance, '1355')) {
+    const auxCods = [...new Set(
+      balance.auxiliares
+        .filter(a => {
+          const cod = String(a.codigo).replace(/\.0$/, '').trim()
+          return cod.length === 8 && cod.startsWith(sub.codigo) && !a.esBasura
+        })
+        .map(a => String(a.codigo).replace(/\.0$/, '').trim())
+    )]
+    const auxDetalle = auxCods
+      .map(cod8 => ({
+        codigo: cod8,
+        nombre: balance.auxiliares.find(a => String(a.codigo).replace(/\.0$/, '').trim() === cod8)?.nombre ?? cod8,
+        valor:  obtenerSFPrefijo(balance, cod8, 'Auxiliar'),
+      }))
+      .filter(x => Math.abs(x.valor) > 0)
+    // 2+ auxiliares → mostrar el desglose; si no → la subcuenta como una línea
+    if (auxDetalle.length >= 2) anticImpuestosDetalle.push(...auxDetalle)
+    else anticImpuestosDetalle.push(sub)
+  }
+  anticImpuestosDetalle.push(...huerfanas1355)
 
   const grupo13Total = obtenerSFPrefijo(balance, '13', 'Cuenta')
   const otrosDeudoresTotal = Math.max(
