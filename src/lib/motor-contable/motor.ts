@@ -1351,9 +1351,19 @@ function calcINGRESOS(
 
     const esAjuste = sc.nombre.toLowerCase().includes('ajuste')
 
+    // Solo discrimina por auxiliar si esos auxiliares TIENEN terceros propios
+    // (evita el caso VEGA: terceros guardados a 6 díg, no bajo el auxiliar de 8).
+    const auxTienenTerceros = balance.auxiliares
+      .filter(a => {
+        const cod = String(a.codigo).replace(/\.0$/, '').trim()
+        return cod.length === 8 && cod.startsWith(sc.codigo) && !a.esBasura
+      })
+      .some(a => obtenerTercerosPrefijo(balance, String(a.codigo).replace(/\.0$/, '').trim()).length > 0)
+
     const debeDiscriminar =
       mostrarAux &&
       subcuentasConAux.includes(sc.codigo) &&
+      auxTienenTerceros &&
       !esDevolucion && !esAjuste
 
     if (debeDiscriminar) {
