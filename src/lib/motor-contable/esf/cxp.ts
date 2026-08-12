@@ -127,10 +127,10 @@ export function hojaCXP(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroC
   const filasSubtotal: number[] = []
   let f = 11
 
-  for (const [codigo, nombre] of subUnion) {
+  // Pinta UNA subcuenta con sus terceros (mismo cuerpo de antes)
+  const pintarSubcuenta = (codigo: string, nombre: string) => {
     const filaSub = f
     f++
-    // terceros con saldo
     const terceroUnion = new Map<string, string>()
     for (const p of r.periodos) {
       const sc = p.pasivoCorriente.cxpDetalle.find(x => x.codigo === codigo); if (!sc) continue
@@ -148,13 +148,31 @@ export function hojaCXP(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroC
     const finT = f - 1
     const subVals = [0,1,2,3,4,5].map(i => snapSub(i, codigo))
     if (finT >= iniT) {
-      writeFormula(filaSub, nombre, (letra) => `${letra}${iniT}:${letra}${finT}`, subVals,
+      writeFormula(filaSub, nombreEfectivo(codigo, nombre), (letra) => `${letra}${iniT}:${letra}${finT}`, subVals,
         { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
     } else {
-      writeRow(filaSub, nombre, subVals, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
+      writeRow(filaSub, nombreEfectivo(codigo, nombre), subVals, { bold: true, fillColor: GRIS_ITEM, brd: bDblTop })
     }
     filasSubtotal.push(filaSub)
     f++ // separador
+  }
+
+  // Pinta un GRUPO (encabezado + sus subcuentas) — corrección contadora VEGA:
+  //   CxP separadas por grupo 22 (Proveedores) y 23 (Acreedores), cada uno por tercero.
+  const pintarGrupo = (titulo: string, prefijo: string) => {
+    const subs = [...subUnion].filter(([cod]) => cod.startsWith(prefijo))
+    if (subs.length === 0) return
+    // Encabezado del grupo (sin cifras, solo rótulo)
+    writeRow(f, titulo, [null, null, null, null, null, null], { bold: true, fillColor: AZUL_H }); f++
+    for (const [codigo, nombre] of subs) pintarSubcuenta(codigo, nombre)
+  }
+
+  pintarGrupo('Proveedores (Grupo 22)', '22')
+  pintarGrupo('Acreedores y Otras Cuentas por Pagar (Grupo 23)', '23')
+
+  // Cualquier subcuenta que no sea 22 ni 23 (por robustez) se pinta al final
+  for (const [codigo, nombre] of subUnion) {
+    if (!codigo.startsWith('22') && !codigo.startsWith('23')) pintarSubcuenta(codigo, nombre)
   }
 
   // ── Total CXP (fila 9) = SUMA de las subcuentas ──
