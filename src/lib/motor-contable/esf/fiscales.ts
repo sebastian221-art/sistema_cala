@@ -156,6 +156,7 @@ export function hojaFISCALES(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: Regi
   writeSection('Retencion Fuente', p => p.pasivoCorriente.reteTotal, 'reteDetalleSubcuentas', { labelFn: labelRete })
   writeSection('Impuesto Industria y Comercio', p => p.pasivoCorriente.icaTotal, 'icaDetalleSubcuentas')
   writeSection('Impuesto al ICA Retenido', p => p.pasivoCorriente.icaRetenido, 'icaRetenidoDetalleSubcuentas')
+  writeSection('Impuesto a las Ventas Retenido', p => p.pasivoCorriente.ivaRetenido, 'ivaRetenidoDetalleSubcuentas')
   writeSection('Impuesto a las Ventas', p => {
     const d = (p.pasivoCorriente as any).ivaDetalleSubcuentas as ItemDetalle[] | undefined
     return d?.reduce((s, x) => s + x.valor, 0) ?? p.pasivoCorriente.ivaTotal
@@ -166,7 +167,7 @@ export function hojaFISCALES(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: Regi
   writeFormula(9, ' Fiscales ',
     (letra) => filasSeccion.map(fr => `${letra}${fr}`).join(','),
     p => p.pasivoCorriente.reteTotal + p.pasivoCorriente.icaRetenido + p.pasivoCorriente.icaTotal +
-         p.pasivoCorriente.ivaTotal + p.pasivoCorriente.impuestosRenta,
+    p.pasivoCorriente.ivaRetenido + p.pasivoCorriente.ivaTotal + p.pasivoCorriente.impuestosRenta,
     { bold: true, fillColor: AZUL_H, brd: bDblTop },
     (p, letra) => reg?.publicar(`fiscales:${p.anio}-${p.mes}`, 'FISCALES', `${letra}9`))
 

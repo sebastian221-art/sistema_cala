@@ -144,6 +144,8 @@ export interface PasivoCorriente {
   reteTotal: number
   reteDetalleSubcuentas: ItemDetalle[] 
   icaRetenido: number
+  ivaRetenido: number
+  ivaRetenidoDetalleSubcuentas: ItemDetalle[]
   aporteEPS: number
   aporteARL: number
   aporteICBF: number
@@ -896,7 +898,7 @@ function calcOBLIFINNC(balance: BalanceParseado) {
 // Observación: cuenta 22 y 23 sin 2365 / 2370 / 2380
 // ══════════════════════════════════════════════════════════════
 
-const EXCLUIR_CXP = ['2365', '2368', '2370', '2380', '2299']
+const EXCLUIR_CXP = ['2365', '2367', '2368', '2370', '2380', '2299']
  
 function calcCXP(balance: BalanceParseado) {
  
@@ -1016,6 +1018,10 @@ function calcFISCALES(balance: BalanceParseado) {
 
   // ── ICA RETENIDO (2368xx) ─────────────────────────────────
   const icaRetenido = neg(obtenerSFPrefijo(balance, '2368', 'Subcuenta'))
+  const ivaRetenido = neg(obtenerSFPrefijo(balance, '2367', 'Subcuenta'))
+  const ivaRetenidoDetalleSubcuentas = balance.subcuentas
+    .filter(c => normCod(c).startsWith('2367') && !c.esBasura && Math.abs(c.saldoFinal) > 0)
+    .map(c => ({ nombre: c.nombre, codigo: normCod(c), valor: neg(c.saldoFinal) }))
   const icaRetenidoDetalleSubcuentas = balance.subcuentas
     .filter(c => normCod(c).startsWith('2368') && !c.esBasura && Math.abs(c.saldoFinal) > 0)
     .map(c => ({ nombre: c.nombre, codigo: normCod(c), valor: neg(c.saldoFinal) }))
@@ -1059,15 +1065,15 @@ function calcFISCALES(balance: BalanceParseado) {
     .filter(c => normCod(c).startsWith('2412') && !c.esBasura && Math.abs(c.saldoFinal) > 0)
     .map(c => ({ nombre: c.nombre, codigo: normCod(c), valor: neg(c.saldoFinal) }))
 
-  const fiscalesTotal = reteTotal + icaRetenido + impuestosRenta + ivaTotal + icaTotal
+  const fiscalesTotal = reteTotal + icaRetenido + ivaRetenido + impuestosRenta + ivaTotal + icaTotal
 
   return {
     reteSalarios, reteHonorarios, reteServicios, reteArrendamientos,
-    reteCompras, autoretenciones, reteTotal, icaRetenido,
+    reteCompras, autoretenciones, reteTotal, icaRetenido,ivaRetenido,
     reteDetalleSubcuentas, icaRetenidoDetalleSubcuentas,
     aporteEPS, aporteARL, aporteICBF, aportePension, aporteNomina,
     nominaTotal, impuestosRenta, ivaTotal, icaTotal, fiscalesTotal,
-    rentaDetalleSubcuentas, ivaDetalleSubcuentas, icaDetalleSubcuentas,
+    rentaDetalleSubcuentas, ivaDetalleSubcuentas, ivaRetenidoDetalleSubcuentas, icaDetalleSubcuentas,
   }
 }
 // ══════════════════════════════════════════════════════════════
