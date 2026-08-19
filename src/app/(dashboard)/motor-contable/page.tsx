@@ -11,6 +11,7 @@ import { SelectorCliente }   from '@/components/motor-contable/SelectorCliente'
 import type { ClienteGuardado } from '@/components/motor-contable/SelectorCliente'
 import { PerfilStep }        from '@/components/motor-contable/PerfilStep'
 import { PreviewConChat }    from '@/components/motor-contable/PreviewConChat'
+import { EsfGuardados }      from '@/components/motor-contable/EsfGuardados'
 import { FileSpreadsheet, Sparkles, FileUp, Settings2, Eye, ArrowLeft } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
@@ -265,12 +266,30 @@ export default function MotorContablePage() {
             </div>
             <div className="mb-5">
               <h2 className="font-semibold text-foreground">
-                {clienteExistente ? `Nuevo balance de ${clienteExistente.nombre_empresa}` : 'Cargar balances'}
+                {clienteExistente ? `${clienteExistente.nombre_empresa}` : 'Cargar balances'}
               </h2>
               <p className="text-sm text-muted-foreground mt-1">
-                Sube uno o varios balances de prueba por tercero exportados desde Siigo.
+                {clienteExistente
+                  ? 'Descarga un estado financiero anterior, o sube un balance nuevo.'
+                  : 'Sube uno o varios balances de prueba por tercero exportados desde Siigo.'}
               </p>
             </div>
+
+            {/* Cliente existente: ver y descargar sus ESF anteriores */}
+            {clienteExistente && (
+              <div className="mb-5 p-4 bg-muted/30 border border-border rounded-xl">
+                <EsfGuardados
+                  nit={clienteExistente.nit}
+                  empresa={clienteExistente.nombre_empresa}
+                />
+              </div>
+            )}
+
+            {clienteExistente && (
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
+                O sube un balance nuevo
+              </p>
+            )}
             <UploadPanel onEstructura={handleEstructura} />
           </>
         )}
