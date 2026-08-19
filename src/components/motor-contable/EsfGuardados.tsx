@@ -33,6 +33,7 @@ export function EsfGuardados({ nit, empresa }: { nit: string; empresa: string })
   const [subiendoMes, setSubiendoMes] = useState(false)
   const [modoEditar, setModoEditar]   = useState(false)
   const [modoMes, setModoMes]         = useState(false)
+  const [mesesNuevos, setMesesNuevos] = useState<File[]>([])
 
   const cargar = () => {
     setLoading(true)
@@ -89,20 +90,24 @@ export function EsfGuardados({ nit, empresa }: { nit: string; empresa: string })
     } catch { toast.error('Error al regenerar') } finally { setRegenerando(false) }
   }
 
-  const agregarMes = async (item: EsfItem, file: File) => {
+  const agregarMeses = async (item: EsfItem, files: File[]) => {
+    if (!files.length) return
     setSubiendoMes(true)
     try {
-      const base64 = btoa(new Uint8Array(await file.arrayBuffer()).reduce((s, b) => s + String.fromCharCode(b), ''))
+      const balances_extra = await Promise.all(files.map(async f => ({
+        nombre: f.name,
+        base64: btoa(new Uint8Array(await f.arrayBuffer()).reduce((s, b) => s + String.fromCharCode(b), '')),
+      })))
       const d = await (await fetch('/api/esf', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accion: 'regenerar', id: item.id, guardar_nuevo: true, balances_extra: [{ nombre: file.name, base64 }] }),
+        body: JSON.stringify({ accion: 'regenerar', id: item.id, guardar_nuevo: true, balances_extra }),
       })).json()
-      if (!d.ok) { toast.error(d.error ?? 'No se pudo agregar el mes'); return }
+      if (!d.ok) { toast.error(d.error ?? 'No se pudieron agregar los meses'); return }
       descargarBase64(d.excel_base64, item)
-      const np = d.periodos?.[d.periodos.length - 1]
-      toast.success(`Mes agregado${np ? ` (${np.mes}/${np.anio})` : ''} y descargado`)
+      const total = d.periodos?.length ?? 0
+      toast.success(`${files.length} mes(es) agregado(s) — el estado financiero ahora tiene ${total} período(s). Descargado.`)
       setModoMes(false); cargar(); setAbierto(null)
-    } catch { toast.error('Error al agregar el mes') } finally { setSubiendoMes(false) }
+    } catch { toast.error('Error al agregar los meses') } finally { setSubiendoMes(false) }
   }
 
   if (loading) return (
@@ -166,7 +171,7 @@ export function EsfGuardados({ nit, empresa }: { nit: string; empresa: string })
             </button>
           )}
           {item.regenerable && (
-            <button onClick={() => { setModoMes(!modoMes); setModoEditar(false) }}
+            <button onClick={() => { setModoMes(!modoMes); setModoEditar(false); setMesesNuevos([]) }}
               className={`${btn} bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500/20`}>
               <Plus className="w-4 h-4" /> Agregar mes
             </button>
@@ -190,18 +195,44 @@ export function EsfGuardados({ nit, empresa }: { nit: string; empresa: string })
           </div>
         )}
 
-        {/* Agregar mes */}
+        {/* Agregar mes(es) */}
         {modoMes && item.regenerable && (
           <div className="p-3 border border-border rounded-xl space-y-2 bg-emerald-500/5">
             <p className="text-xs text-muted-foreground">
-              Sube el balance del mes nuevo. Se agrega a este estado financiero (con su fecha)
-              sin re-subir los meses anteriores.
+              Sube uno o varios balances de meses nuevos. Se agregan a este estado financiero
+              (con sus fechas) sin re-subir los meses anteriores.
             </p>
+
+            {mesesNuevos.length > 0 && (
+              <div className="space-y-1">
+                {mesesNuevos.map((f, i) => (
+                  <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg bg-background border border-border text-sm">
+                    <span className="flex items-center gap-2 min-w-0"><FileText className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" /><span className="truncate">{f.name}</span></span>
+                    <button onClick={() => setMesesNuevos(prev => prev.filter((_, j) => j !== i))} className="text-muted-foreground hover:text-red-500"><Trash2 className="w-3.5 h-3.5" /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <label className={`flex items-center justify-center gap-2 px-3 py-3 rounded-lg border-2 border-dashed border-emerald-400/50 text-sm font-medium text-emerald-700 cursor-pointer hover:bg-emerald-500/10 transition-colors ${subiendoMes ? 'opacity-50 pointer-events-none' : ''}`}>
-              {subiendoMes ? <><Loader2 className="w-4 h-4 animate-spin" /> Agregando el mes...</> : <><Upload className="w-4 h-4" /> Subir balance del mes nuevo (.xlsx)</>}
-              <input type="file" accept=".xlsx,.xls" className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) agregarMes(item, f) }} />
+              <Plus className="w-4 h-4" /> {mesesNuevos.length ? 'Agregar otro balance' : 'Seleccionar balances (.xlsx)'}
+              <input type="file" accept=".xlsx,.xls" multiple className="hidden"
+                onChange={e => {
+                  const nuevos = Array.from(e.target.files ?? [])
+                  setMesesNuevos(prev => {
+                    const nombres = new Set(prev.map(f => f.name))
+                    return [...prev, ...nuevos.filter(f => !nombres.has(f.name))]
+                  })
+                  e.currentTarget.value = ''
+                }} />
             </label>
+
+            {mesesNuevos.length > 0 && (
+              <button onClick={() => agregarMeses(item, mesesNuevos)} disabled={subiendoMes}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-emerald-600 text-white font-semibold hover:bg-emerald-700 transition-colors disabled:opacity-50">
+                {subiendoMes ? <><Loader2 className="w-4 h-4 animate-spin" /> Agregando {mesesNuevos.length} mes(es)...</> : <><Upload className="w-4 h-4" /> Agregar {mesesNuevos.length} mes(es) al estado financiero</>}
+              </button>
+            )}
           </div>
         )}
       </div>
