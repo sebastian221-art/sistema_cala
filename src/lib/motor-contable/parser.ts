@@ -470,8 +470,11 @@ export function parsearBalance(
   const rawFilas = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: null, raw: true })
   const headerIdx = encontrarHeader(rawFilas)
 
+  // FIX desfase: si el !ref no empieza en A1 (hay filas vacías arriba, como el
+  // "Balance Detallado" de TEXTAMPA), el range absoluto debe sumar ese origen.
+  const origenRef = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']).s.r : 0
   const datos = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, {
-    header: 0, range: headerIdx, defval: null, raw: true,
+    header: 0, range: headerIdx + origenRef, defval: null, raw: true,
   })
   if (!datos.length) throw new Error(`Hoja "${hoja}" sin datos`)
 
