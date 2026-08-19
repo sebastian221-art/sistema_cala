@@ -16,6 +16,7 @@ import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
 import type { EstructuraCliente } from '@/lib/motor-contable/extraerEstructura'
 import type { PerfilCliente, ResultadoSimilitud } from '@/lib/perfiles/calcularSimilitud'
+import { EsfGuardados } from '@/components/motor-contable/EsfGuardados'
 
 interface Props {
   empresa:        string
@@ -133,6 +134,11 @@ export function PerfilStep({ empresa, nit, estructura, perfilExistente, onPerfil
             Reglas guardadas
           </p>
           <ResumenPerfil perfil={perfil} />
+        </div>
+
+        {/* Estados financieros anteriores de este cliente (ver y descargar) */}
+        <div className="p-4 bg-muted/30 border border-border rounded-xl">
+          <EsfGuardados nit={nit} empresa={empresa} />
         </div>
 
         <button

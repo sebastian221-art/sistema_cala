@@ -166,8 +166,28 @@ export function PreviewConChat({
     setConfirmando(true)
     try {
       await onConfirmar(perfil)
+
+      // Guardar el ESF generado para poder re-descargarlo desde "cliente existente"
+      if (resultado.excel_base64) {
+        const p = periodos[periodos.length - 1]
+        try {
+          await fetch('/api/esf', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              nit,
+              nombre_empresa: empresa,
+              mes:   p?.mes ?? null,
+              anio:  p?.anio ?? null,
+              label: p ? `${p.mes}/${p.anio}` : null,
+              excel_base64: resultado.excel_base64,
+            }),
+          })
+        } catch { /* si falla el guardado del Excel, no bloquea la confirmación */ }
+      }
+
       setConfirmado(true)
-      toast.success('Estado financiero confirmado y perfil guardado')
+      toast.success('Estado financiero confirmado y guardado')
     } catch {
       toast.error('Error al guardar el perfil')
     } finally {
