@@ -323,7 +323,8 @@ export default function MotorContablePage() {
               </button>
             </div>
             <PreviewConChat
-              resultado={resultado}
+
+              archivos={datos.archivos}              resultado={resultado}
               estructura={datos.estructura}
               perfil={perfilActivo}
               empresa={datos.empresa}

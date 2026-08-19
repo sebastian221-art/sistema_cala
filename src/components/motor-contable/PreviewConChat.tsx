@@ -28,6 +28,7 @@ interface MensajeChat {
 interface Props {
   resultado:   ResultadoAPI
   estructura:  EstructuraCliente
+  archivos?:   File[]   // los balances, para guardarlos y poder regenerar
   perfil:      PerfilCliente
   empresa:     string
   nit:         string
@@ -56,7 +57,7 @@ function pareceCorreccionDeNumero(texto: string): boolean {
 
 export function PreviewConChat({
   resultado: resultadoInicial, estructura, perfil: perfilInicial,
-  empresa, nit, prefijos, onRegenerar, onConfirmar,
+  empresa, nit, prefijos, archivos, onRegenerar, onConfirmar,
 }: Props) {
 
   const [resultado, setResultado] = useState<ResultadoAPI>(resultadoInicial)
@@ -171,16 +172,26 @@ export function PreviewConChat({
       if (resultado.excel_base64) {
         const p = periodos[periodos.length - 1]
         try {
+          // Convertir los balances a base64 para poder regenerar después
+          const balances_json = archivos && archivos.length
+            ? await Promise.all(archivos.map(async f => ({
+                nombre: f.name,
+                base64: btoa(new Uint8Array(await f.arrayBuffer()).reduce((s, b) => s + String.fromCharCode(b), '')),
+              })))
+            : null
           await fetch('/api/esf', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              accion: 'guardar',
               nit,
               nombre_empresa: empresa,
               mes:   p?.mes ?? null,
               anio:  p?.anio ?? null,
               label: p ? `${p.mes}/${p.anio}` : null,
               excel_base64: resultado.excel_base64,
+              perfil_json:   perfil,
+              balances_json,
             }),
           })
         } catch { /* si falla el guardado del Excel, no bloquea la confirmación */ }
