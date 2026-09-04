@@ -227,6 +227,11 @@ function encontrarHeader(filas: unknown[][]): number {
     const tieneNombre = textos.some(t => t === 'nombre')
     const tieneDebAct = textos.some(t => t === 'debito actual' || t === 'debito anterior')
     if (tieneCodigo && tieneNombre && tieneDebAct) return i
+    // Libro de inventarios y balances: "cuenta" + "saldo final" + "nombre de la cuenta"
+    const tieneCuentaLib    = textos.some(t => t === 'cuenta')
+    const tieneSaldoFinLib  = textos.some(t => t === 'saldo final')
+    const tieneNombreCtaLib = textos.some(t => t.includes('nombre de la cuenta'))
+    if (tieneCuentaLib && tieneSaldoFinLib && tieneNombreCtaLib) return i
     // World Office: "cuenta" + "nombre cuenta" + "saldo"
     const tieneCuenta = textos.some(t => t === 'cuenta')
     const tieneNombreCta = textos.some(t => t === 'nombre cuenta' || t.includes('nombre cuenta'))
@@ -280,10 +285,10 @@ function mapCols(headers: string[]): ColMap {
     // Siigo: "nombre cuenta contable" | WO: "nombre cuenta" | SIESA: "desc. auxiliar" | SYD: "nombre"
     nombre:   find('nombre cuenta contable', 'nombre cuenta', 'nombre cta', 'desc. auxiliar', 'desc auxiliar', 'nombre'),
     // Siigo: "identificacion" | World Office / SIESA: "tercero" (el NIT del tercero)
-    nit:      find('identificacion', 'nit', 'tercero'),
+    nit:      find('identificacion', 'nit', 'identidad', 'tercero'),
     sucursal: find('sucursal'),
     // Siigo/WO: "nombre tercero" | SIESA: "razon social tercero movto."
-    tercero:  find('nombre tercero', 'razon social tercero'),
+    tercero:  find('nombre tercero', 'nombre del tercero', 'razon social tercero'),
     // Siigo: "saldo inicial" | World Office: "saldo anterior" | SIESA: "saldo inicial"
     si:       find('saldo inicial', 'saldo anterior'),
     // Siigo: "movimiento debito" | World Office / SIESA: "debito(s)" | SYD: "debito"
@@ -656,7 +661,23 @@ export function parsearBalance(
     })
   }
 
-  const modoSignos = detectarModo(cuentas)
+  let modoSignos = detectarModo(cuentas)
+
+  // Normalizar POSITIVO → NEGATIVO: el motor asume el estándar colombiano
+  // (pasivo/patrimonio/ingresos negativos). Si el balance viene TODO positivo
+  // (ej. "Libro de inventarios y balances"), volteamos clases 2, 3 y 4 para que
+  // el motor lo procese igual que cualquier otro balance. Solo corre si se
+  // detecta POSITIVO, así que NO afecta a los que ya vienen en NEGATIVO.
+  if (modoSignos === 'POSITIVO') {
+    for (const c of cuentas) {
+      const cl = c.codigo[0]
+      if (cl === '2' || cl === '3' || cl === '4') {
+        c.saldoInicial = -c.saldoInicial
+        c.saldoFinal   = -c.saldoFinal
+      }
+    }
+    modoSignos = 'NEGATIVO'
+  }
 
   const clases        = cuentas.filter(c => c.nivel === 'Clase')
   const grupos        = cuentas.filter(c => c.nivel === 'Grupo')
