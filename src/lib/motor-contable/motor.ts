@@ -852,7 +852,10 @@ function calcPYP(balance: BalanceParseado): ActivoNoCorriente {
     }))
 
   const ppyeNeto           = ppyeBruto + depreciacionAcumulada
-  const intangiblesTotal   = obtenerSFPrefijo(balance, '16', 'Cuenta')
+    // SYD a veces no trae el nivel Cuenta (4 díg); caer a Subcuenta o Grupo
+    const intangiblesTotal   = obtenerSFPrefijo(balance, '16', 'Cuenta')
+    || obtenerSFPrefijo(balance, '16', 'Subcuenta')
+    || obtenerSFPrefijo(balance, '16', 'Grupo')
   const intangiblesDetalle = subcuentasComoDetalle(balance, '16')
   const diferidosTotal     = obtenerSFPrefijo(balance, '17', 'Cuenta')
   const otrosActivosNC     = Math.max(
