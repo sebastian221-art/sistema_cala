@@ -805,24 +805,28 @@ function calcPYP(balance: BalanceParseado): ActivoNoCorriente {
     .map(c => {
       const cod = String(c.codigo).replace(/\.0$/, '').trim()
 
-      let auxiliares = auxiliaresListadoPPyE(balance, cod)
+           // Auxiliares = las SUBCUENTAS de 6 díg (cuentas reales), NUNCA terceros.
+      // En SYD los "auxiliares" son NITs de proveedores → la contadora pide la
+      // cuenta mayor (6/8 díg), no el tercero.
+      let auxiliares = balance.subcuentas
+        .filter(s => {
+          const sCod = String(s.codigo).replace(/\.0$/, '').trim()
+          return (
+            sCod.startsWith(cod) && sCod.length >= 6 && sCod !== cod &&
+            !sCod.startsWith('159') && !s.esBasura && Math.abs(s.saldoFinal) > 0
+          )
+        })
+        .map(s => ({
+          nombre: s.nombre,
+          codigo: String(s.codigo).replace(/\.0$/, '').trim(),
+          valor:  s.saldoFinal,
+        }))
 
+      // Fallback: solo si no hay subcuentas reales, usar el listado por nombre
+      // (excluyendo terceros con NIT para no duplicar como pidió la contadora)
       if (auxiliares.length === 0) {
-        auxiliares = balance.subcuentas
-          .filter(s => {
-            const sCod = String(s.codigo).replace(/\.0$/, '').trim()
-            return (
-              sCod.startsWith(cod) &&
-              !sCod.startsWith('159') &&
-              !s.esBasura &&
-              Math.abs(s.saldoFinal) > 0
-            )
-          })
-          .map(s => ({
-            nombre: s.nombre,
-            codigo: String(s.codigo).replace(/\.0$/, '').trim(),
-            valor:  s.saldoFinal,
-          }))
+        auxiliares = auxiliaresListadoPPyE(balance, cod)
+          .filter(a => !/^\d{7,}$/.test(String((a as any).nit ?? '')))
       }
 
       return {

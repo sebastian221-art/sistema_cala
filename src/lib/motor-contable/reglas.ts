@@ -206,7 +206,7 @@ export function construirRenglones(p: PeriodoCalculado): Renglones {
     inversiones:            mk('inversiones', ac.inversionesTotal),
     cuentasPorCobrar:       mk('cuentasPorCobrar',
                                ac.clientesTotal + ac.anticiposTotal +
-                               (ac.otrosDeudoresTotal ?? 0)),
+                               (ac.otrosDeudoresTotal ?? 0) + ac.anticipoImpuestosTotal),
     inventarios:            mk('inventarios', ac.inventarioTotal),
     otrosActivosCorrientes: mk('otrosActivosCorrientes', ac.otrosActivosCorrientes ?? 0),
 
@@ -214,11 +214,13 @@ export function construirRenglones(p: PeriodoCalculado): Renglones {
     ppye:                     mk('ppye', anc.ppyeNeto),
     otrosActivosNoCorrientes: mk('otrosActivosNoCorrientes',
                                  anc.intangiblesTotal + anc.diferidosTotal +
-                                 anc.otrosActivosNC + ac.anticipoImpuestosTotal),
+                                 anc.otrosActivosNC),
 
     // PASIVO CORRIENTE
     financierosCorriente:  mk('financierosCorriente', pc.obligFinCorrTotal),
-    proveedores:           mk('proveedores', pc.proveedoresTotal),
+    // proveedores = TODO lo de CXP (22/23) menos costos/gastos, para no perder
+    // cuentas como 2355 (deudas con accionistas). cxpTotal ya excluye retenciones/aportes.
+    proveedores:           mk('proveedores', pc.cxpTotal - pc.costosGastosPagar),
     costosGastosPagar:     mk('costosGastosPagar', pc.costosGastosPagar),
     fiscales:              mk('fiscales', pc.fiscalesTotal),
     beneficiosEmpleados:   mk('beneficiosEmpleados', pc.beneficiosCorrTotal),
