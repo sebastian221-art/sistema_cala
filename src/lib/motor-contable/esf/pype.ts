@@ -126,9 +126,20 @@ export function hojaPYP(wb: ExcelJS.Workbook, r: ResultadoMotor, reg?: RegistroC
     const auxList = [...auxUnion]
 
     const scVals = [0,1,2,3,4,5].map(i => snap(i, p => p.activoNoCorriente.detallePPyEConAux?.find(x => x.codigo === sc.codigo)?.total ?? 0))
-    if (auxList.length > 0) {
+
+    // FIX duplicidad: si hay UN solo auxiliar cuyo valor es ~igual al de la
+    // subcuenta (mismo monto que el encabezado), es un duplicado → no mostrarlo.
+    // Así la contadora ve solo la cuenta mayor, sin repetir la línea.
+    const auxListSinDup = auxList.filter(auxNombre => {
+      if (auxList.length !== 1) return true
+      const av = snapAux(0, sc.codigo, auxNombre) ?? 0
+      const sv = scVals[0] ?? 0
+      return Math.abs(av - sv) > 1   // distinto valor → es detalle real; igual → duplicado
+    })
+
+    if (auxListSinDup.length > 0) {
       const ini = f
-      for (const auxNombre of auxList) {
+      for (const auxNombre of auxListSinDup) {
         const auxVals = [0,1,2,3,4,5].map(i => snapAux(i, sc.codigo, auxNombre))
         writeRow(f, auxNombre, auxVals, { brd: bDashedTop, indent: '   ' }); f++
       }
