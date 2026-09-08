@@ -778,10 +778,28 @@ function calcPYP(balance: BalanceParseado): ActivoNoCorriente {
     String(c.codigo).replace(/\.0$/, '').trim().length === 4
   )
 
-  const headers15 =
-    cuentas15_4d.length > 0   ? cuentas15_4d   :   // balance.cuentas tiene 4-digit
-    subcuentas15_4d.length > 0 ? subcuentas15_4d :  // balance.subcuentas tiene 4-digit
-    all15.filter(c => String(c.codigo).replace(/\.0$/, '').trim().length === 6) // fallback 6-digit
+    // Deduplicar por CÓDIGO: en SYD el mismo código (152020) aparece muchas veces
+  // (una por tercero), lo que duplicaba "HALCON GROUP" e inflaba el total.
+  // Tomamos UNA entrada por código, con el valor de mayor magnitud (el agregado
+  // de la cuenta) y el nombre de la cuenta real (no el del tercero).
+  const mapaHeaders = new Map<string, { codigo: string; nombre: string; saldoFinal: number; esBasura?: boolean }>()
+  const candidatos15 =
+    cuentas15_4d.length > 0    ? cuentas15_4d :
+    subcuentas15_4d.length > 0 ? subcuentas15_4d :
+    all15.filter(c => String(c.codigo).replace(/\.0$/, '').trim().length === 6)
+  for (const c of candidatos15) {
+    const cod = String(c.codigo).replace(/\.0$/, '').trim()
+    const esTercero = !!((c as any).nit || (c as any).nombreTercero)
+    const prev = mapaHeaders.get(cod)
+    if (!prev) {
+      mapaHeaders.set(cod, { codigo: cod, nombre: c.nombre, saldoFinal: c.saldoFinal, esBasura: c.esBasura })
+    } else {
+      // preferir nombre de cuenta real (sin tercero); mantener el valor de mayor magnitud (no sumar duplicados)
+      if (!esTercero && /^[A-Za-z]/.test(c.nombre)) prev.nombre = c.nombre
+      if (Math.abs(c.saldoFinal) > Math.abs(prev.saldoFinal)) prev.saldoFinal = c.saldoFinal
+    }
+  }
+  const headers15 = [...mapaHeaders.values()]
   // ── PPyE bruto = suma de headers (sin duplicar) ───────────
   const ppyeBruto = headers15
     .filter(c => Math.abs(c.saldoFinal) > 0)
@@ -808,11 +826,14 @@ function calcPYP(balance: BalanceParseado): ActivoNoCorriente {
            // Auxiliares = las SUBCUENTAS de 6 díg (cuentas reales), NUNCA terceros.
       // En SYD los "auxiliares" son NITs de proveedores → la contadora pide la
       // cuenta mayor (6/8 díg), no el tercero.
-      let auxiliares = balance.subcuentas
+            // Auxiliares = SOLO subcuentas de 6 díg REALES (length === 6, NUNCA 8 díg,
+      // que en SYD son terceros como HALCON GROUP). Sin fallback: si no hay
+      // subcuentas de 6 díg, la cuenta se muestra sola (solo la cuenta mayor).
+      const auxiliares = balance.subcuentas
         .filter(s => {
           const sCod = String(s.codigo).replace(/\.0$/, '').trim()
           return (
-            sCod.startsWith(cod) && sCod.length >= 6 && sCod !== cod &&
+            sCod.startsWith(cod) && sCod.length === 6 && sCod !== cod &&
             !sCod.startsWith('159') && !s.esBasura && Math.abs(s.saldoFinal) > 0
           )
         })
@@ -821,13 +842,6 @@ function calcPYP(balance: BalanceParseado): ActivoNoCorriente {
           codigo: String(s.codigo).replace(/\.0$/, '').trim(),
           valor:  s.saldoFinal,
         }))
-
-      // Fallback: solo si no hay subcuentas reales, usar el listado por nombre
-      // (excluyendo terceros con NIT para no duplicar como pidió la contadora)
-      if (auxiliares.length === 0) {
-        auxiliares = auxiliaresListadoPPyE(balance, cod)
-          .filter(a => !/^\d{7,}$/.test(String((a as any).nit ?? '')))
-      }
 
       return {
         codigo:    cod,
