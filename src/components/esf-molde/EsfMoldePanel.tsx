@@ -211,6 +211,9 @@ export function EsfMoldePanel() {
   const [esfFile, setEsfFile] = useState<File | null>(null)
   const [balFile, setBalFile] = useState<File | null>(null)
   const [procesando, setProcesando] = useState(false)
+  const [nitManual, setNitManual] = useState('')
+  const [nombreManual, setNombreManual] = useState('')
+  const [pideDatos, setPideDatos] = useState(false)
   const [repAprender, setRepAprender] = useState<ReporteAprender | null>(null)
   const [resultadoNueva, setResultadoNueva] = useState<{ id: string; empresa: string; nit: string; anio: number; mes: number } | null>(null)
 
@@ -263,10 +266,15 @@ export function EsfMoldePanel() {
     try {
       const fd = new FormData()
       fd.append('action', 'aprender'); fd.append('esf', esfFile); fd.append('balance', balFile)
+      if (nitManual.trim()) fd.append('nit', nitManual.trim())
+      if (nombreManual.trim()) fd.append('nombre_empresa', nombreManual.trim())
       const res = await fetch('/api/esf-molde', { method: 'POST', body: fd })
       let d: any = null
       try { d = await res.json() } catch { d = null }
-      if (!res.ok || !d?.ok) { toast.error(d?.error ?? `Error ${res.status}`); return }
+      if (!res.ok || !d?.ok) {
+        if (d?.faltan_datos) setPideDatos(true)
+        toast.error(d?.error ?? `Error ${res.status}`, { duration: 8000 }); return
+      }
       setRepAprender(d.reporte); setResultadoNueva({ id: d.id, empresa: d.empresa, nit: d.nit, anio: d.anio, mes: d.mes })
       toast.success(`Molde aprendido: ${d.empresa}`)
       cargarEmpresas()
@@ -364,6 +372,19 @@ export function EsfMoldePanel() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <FileDrop label="ESF histórico (.xlsx)" hint="El estado financiero completo, ya formulado" file={esfFile} onFile={setEsfFile} />
                   <FileDrop label="Balance de prueba del mismo mes" hint="Siigo, World Office, SIESA o SYD" file={balFile} onFile={setBalFile} />
+                </div>
+                <div className="rounded-xl border border-border p-4 space-y-2">
+                  <button type="button" onClick={() => setPideDatos(v => !v)} className="text-xs font-medium text-muted-foreground hover:text-foreground">
+                    {pideDatos ? '▾' : '▸'} Datos de la empresa (obligatorios si el balance es World Office o SIESA, que no traen NIT ni nombre)
+                  </button>
+                  {pideDatos && (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                      <input value={nombreManual} onChange={e => setNombreManual(e.target.value)} placeholder="Nombre de la empresa"
+                        className="px-3 py-2 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
+                      <input value={nitManual} onChange={e => setNitManual(e.target.value)} placeholder="NIT (ej. 901863483-5)"
+                        className="px-3 py-2 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
+                    </div>
+                  )}
                 </div>
                 <button onClick={aprender} disabled={procesando || !esfFile || !balFile}
                   className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-primary text-primary-foreground rounded-xl font-semibold hover:bg-primary-light transition-colors disabled:opacity-50">
