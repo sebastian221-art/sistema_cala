@@ -98,8 +98,15 @@ export async function POST(req: NextRequest) {
     }
     const balancePath = join(dir, 'balance.json')
     await writeFile(balancePath, JSON.stringify(balanceJson), 'utf-8')
-    const nit = limpiarNit(String(form.get('nit') ?? '') || balanceJson.nit)
-    const empresa = String(form.get('nombre_empresa') ?? '') || balanceJson.empresa
+    const nit = limpiarNit(String(form.get('nit') ?? '').trim() || balanceJson.nit)
+    const empresa = String(form.get('nombre_empresa') ?? '').trim() || balanceJson.empresa
+    // World Office y SIESA no traen empresa/NIT en el archivo: hay que pedirlos
+    if (action === 'aprender' && (!nit || !empresa || /^EMPRESA \(/.test(empresa))) {
+      return NextResponse.json({ ok: false, faltan_datos: true, error: 'El balance no trae el NIT o el nombre de la empresa (pasa con World Office y SIESA). Escríbelos abajo y vuelve a intentar.' }, { status: 400 })
+    }
+    if (action === 'aprender' && /^EMPRESA \(/.test(empresa)) {
+      return NextResponse.json({ ok: false, faltan_datos: true, error: 'Escribe el nombre de la empresa.' }, { status: 400 })
+    }
 
     // ══ APRENDER ══
     if (action === 'aprender') {

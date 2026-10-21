@@ -623,7 +623,7 @@ def aprender(esf_path, balance_path, molde_out):
     bal = Balance(json.load(open(balance_path, encoding='utf-8')))
     esf_opt = cargar_optimizado(esf_path)
     wb = openpyxl.load_workbook(esf_opt)                       # fórmulas
-    molde = {'version': 1, 'empresa': bal.meta['empresa'], 'nit': bal.meta['nit'],
+    molde = {'version': 1, 'empresa': bal.meta['empresa'] or '', 'nit': bal.meta['nit'] or '',
              'periodo_base': {'anio': bal.meta['anio'], 'mes': bal.meta['mes']},
              'hojas': {}, 'hojas_omitidas': {}, 'orden_hojas': wb.sheetnames}
     reporte = {'hojas': {}, 'hojas_omitidas': {}, 'manual': [], 'constante': [], 'dudosos': [], 'sin_ubicar': [], 'resumen': {}}
@@ -646,9 +646,9 @@ def aprender(esf_path, balance_path, molde_out):
             del periodos_por_hoja[nombre]
     pm_anio, pm_mes = divmod(periodo_max, 100)
     if (pm_anio, pm_mes) != (bal.meta['anio'], bal.meta['mes']) and bal.meta['mes']:
-        reporte.setdefault('advertencias', []).append(
+        raise SystemExit(
             f"El ESF va en {ABREV[pm_mes]} {pm_anio} pero el balance es de {ABREV.get(bal.meta['mes'], '?')} {bal.meta['anio']}. "
-            f"Para aprender el mapeo deben ser del MISMO mes.")
+            f"Para aprender el molde, el balance debe ser del MISMO mes en que va el ESF ({ABREV[pm_mes]} {pm_anio}).")
     molde['periodo_base'] = {'anio': pm_anio, 'mes': pm_mes}
     vals = Valores(esf_opt, list(periodos_por_hoja.keys()))
 
@@ -867,6 +867,12 @@ def aprender(esf_path, balance_path, molde_out):
         for k, n in c.items():
             tot[k] += n
     reporte['resumen'] = dict(tot)
+    n_bal = tot.get('BALANCE', 0)
+    n_num = n_bal + tot.get('MANUAL', 0)
+    if n_bal == 0 or (n_num >= 10 and n_bal < 0.3 * n_num):
+        raise SystemExit(
+            f"Solo {n_bal} de {n_num} números del ESF cruzan con el balance. Casi seguro NO son de la misma empresa "
+            f"o del mismo mes (ESF: {molde['empresa'] or '?'} / balance: {bal.meta['empresa'] or '?'} NIT {bal.meta['nit'] or '?'}). No se guardó nada.")
     reporte['resumen']['hojas_con_meses'] = len(molde['hojas'])
     reporte['resumen']['hojas_total'] = len(wb.sheetnames)
     reporte['resumen']['periodo_base'] = molde['periodo_base']
@@ -994,8 +1000,9 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                'hojas': {}, 'revisar': [], 'terceros_nuevos': [], 'sin_ubicar': [], 'advertencias': []}
 
     if (nuevo_anio * 100 + nuevo_mes) <= (base['anio'] * 100 + base['mes']):
-        reporte['advertencias'].append(
-            f"El balance es de {nuevo_mes}/{nuevo_anio} y el ESF ya va en {base['mes']}/{base['anio']}. Se agrega igual, revisa el orden.")
+        raise SystemExit(
+            f"El ESF ya va en {ABREV[base['mes']]} {base['anio']} y el balance es de {ABREV.get(nuevo_mes, '?')} {nuevo_anio}. "
+            f"Solo se puede agregar un mes POSTERIOR. Si quieres rehacer un mes, borra esa versión y vuelve a agregarlo.")
     if molde.get('nit') and bal.meta['nit'] and norm(molde['nit']).replace('-', '').replace('.', '') != norm(bal.meta['nit']).replace('-', '').replace('.', ''):
         reporte['advertencias'].append(f"NIT distinto: molde {molde['nit']} vs balance {bal.meta['nit']}.")
 
@@ -1288,7 +1295,10 @@ if __name__ == '__main__':
         else:
             print(__doc__)
             sys.exit(2)
-    except SystemExit:
+    except SystemExit as e:
+        if e.code and not isinstance(e.code, int):
+            print(json.dumps({'ok': False, 'error': str(e.code)}, ensure_ascii=False))
+            sys.exit(1)
         raise
     except Exception as e:
         import traceback
