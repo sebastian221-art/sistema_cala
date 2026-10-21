@@ -233,6 +233,8 @@ def similitud(a, b):
 # Se quitan las filas sin ningún valor/fórmula de las hojas gigantes.
 # ─────────────────────────────────────────────────────────────────────────
 ROW_RE_XML = re.compile(rb'<row\b[^>]*?(?:/>|>.*?</row>)', re.S)
+# celda vacía (solo estilo) en columna de 3 letras (AAA en adelante = col 703+): nunca hay datos ahí
+CELDA_VACIA_LEJANA_RE = re.compile(rb'<c r="[A-Z]{3}\d+"(?: [^>]*?)?/>')
 
 
 def _fila_vacia(m):
@@ -240,13 +242,86 @@ def _fila_vacia(m):
     return b'<v>' not in s and b'<f' not in s and b'<is>' not in s
 
 
+def optimizar_styles(data, umbral_estilos=2000):
+    """
+    Excel acumula miles de estilos con nombre ("20% - Énfasis1 10 2 2 2 2") al copiar hojas
+    entre libros. openpyxl crea un objeto por cada uno y se come la RAM. Se conservan solo
+    los cellStyleXfs/cellStyles referenciados por las celdas (xfId) y se renumeran.
+    """
+    m_csx = re.search(rb'<cellStyleXfs count="(\d+)">(.*?)</cellStyleXfs>', data, re.S)
+    m_cs = re.search(rb'<cellStyles count="(\d+)">(.*?)</cellStyles>', data, re.S)
+    m_cx = re.search(rb'<cellXfs count="(\d+)">(.*?)</cellXfs>', data, re.S)
+    if not (m_csx and m_cs and m_cx) or int(m_csx.group(1)) < umbral_estilos:
+        return data
+    xfs = re.findall(rb'<xf\b[^>]*?(?:/>|>.*?</xf>)', m_csx.group(2), re.S)
+    usados = {0} | {int(x) for x in re.findall(rb'xfId="(\d+)"', m_cx.group(2))}
+    usados = sorted(i for i in usados if i < len(xfs))
+    nuevo_idx = {old: new for new, old in enumerate(usados)}
+    nuevos_xfs = b''.join(xfs[i] for i in usados)
+    estilos = re.findall(rb'<cellStyle\b[^>]*?(?:/>|>.*?</cellStyle>)', m_cs.group(2), re.S)
+    nuevos_estilos = []
+    vistos = set()
+    for e in estilos:
+        mm = re.search(rb'xfId="(\d+)"', e)
+        if not mm:
+            continue
+        old = int(mm.group(1))
+        if old in nuevo_idx and old not in vistos:
+            vistos.add(old)
+            nuevos_estilos.append(re.sub(rb'xfId="\d+"', b'xfId="%d"' % nuevo_idx[old], e, count=1))
+    cellxfs = re.sub(rb'xfId="(\d+)"', lambda mm: b'xfId="%d"' % nuevo_idx.get(int(mm.group(1)), 0), m_cx.group(2))
+    data = (data[:m_csx.start()] + b'<cellStyleXfs count="%d">' % len(usados) + nuevos_xfs + b'</cellStyleXfs>' + data[m_csx.end():])
+    # recalcular posiciones tras el primer reemplazo
+    m_cx = re.search(rb'<cellXfs count="(\d+)">(.*?)</cellXfs>', data, re.S)
+    data = data[:m_cx.start()] + b'<cellXfs count="%s">' % m_cx.group(1) + cellxfs + b'</cellXfs>' + data[m_cx.end():]
+    m_cs = re.search(rb'<cellStyles count="(\d+)">(.*?)</cellStyles>', data, re.S)
+    data = data[:m_cs.start()] + b'<cellStyles count="%d">' % len(nuevos_estilos) + b''.join(nuevos_estilos) + b'</cellStyles>' + data[m_cs.end():]
+    return data
+
+
+MERGE_RE_XML = re.compile(rb'<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"')
+ROW_NUM_RE_XML = re.compile(rb'<row r="(\d+)"')
+
+
+def recortar_merges(data, max_area=50_000):
+    """
+    Rangos combinados gigantes (una columna separadora combinada de la fila 1 a la 1.048.576)
+    hacen que openpyxl cree un millón de celdas por cada uno. Se recortan a la última fila
+    con datos de la hoja. Solo afecta merges con área > max_area.
+    """
+    filas = [int(x) for x in ROW_NUM_RE_XML.findall(data)]
+    ultima = max(filas) if filas else 1
+    def fix(m):
+        c1, r1, c2, r2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+        area = (r2 - r1 + 1) * (column_index_from_string(c2.decode()) - column_index_from_string(c1.decode()) + 1)
+        if area <= max_area:
+            return m.group(0)
+        r2n = max(r1, min(r2, ultima))
+        if r2n == r1 and c1 == c2:
+            r2n = r1 + 1        # merge mínimo de 2 celdas para no dejar un rango inválido
+        return b'<mergeCell ref="%s%d:%s%d"' % (c1, r1, c2, r2n)
+    return MERGE_RE_XML.sub(fix, data)
+
+
 def optimizar_xlsx(src, dst, umbral=3_000_000):
-    """Copia src → dst quitando filas vacías de las hojas cuyo XML pese más de `umbral` bytes."""
+    """
+    Copia src → dst aligerando las hojas cuyo XML pese más de `umbral` bytes:
+      - quita filas sin ningún valor/fórmula (hojas con 1M de filas formateadas), y
+      - quita celdas vacías con solo formato en columnas lejanas (AAA en adelante),
+        que algunas hojas arrastran por miles en cada fila.
+    Sin esto openpyxl puede necesitar varios GB de RAM.
+    """
     with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             data = zin.read(item.filename)
-            if item.filename.startswith('xl/worksheets/sheet') and item.filename.endswith('.xml') and len(data) > umbral:
-                data = ROW_RE_XML.sub(lambda m: b'' if _fila_vacia(m) else m.group(0), data)
+            if item.filename.startswith('xl/worksheets/sheet') and item.filename.endswith('.xml'):
+                if len(data) > umbral:
+                    data = ROW_RE_XML.sub(lambda m: b'' if _fila_vacia(m) else m.group(0), data)
+                    data = CELDA_VACIA_LEJANA_RE.sub(b'', data)
+                if b'<mergeCell ' in data:
+                    data = recortar_merges(data)
+            elif item.filename == 'xl/styles.xml':
+                data = optimizar_styles(data)
             zout.writestr(item, data)
 
 
@@ -309,11 +384,31 @@ def formula_con_placeholder(formula, idx):
 # ─────────────────────────────────────────────────────────────────────────
 # Detección de columnas de período en cada hoja
 # ─────────────────────────────────────────────────────────────────────────
-def detectar_periodos(ws):
+NOMBRE_MES = {1: 'ENERO', 2: 'FEBRERO', 3: 'MARZO', 4: 'ABRIL', 5: 'MAYO', 6: 'JUNIO', 7: 'JULIO',
+              8: 'AGOSTO', 9: 'SEPTIEMBRE', 10: 'OCTUBRE', 11: 'NOVIEMBRE', 12: 'DICIEMBRE'}
+
+
+def texto_mes(mes, ejemplo):
+    """Escribe el mes nuevo con el mismo estilo del encabezado de ejemplo ('ABR', 'AGOSTO', 'Agosto')."""
+    ej = str(ejemplo or '').strip()
+    completo = norm(ej) in NOMBRE_MES.get(MESES.get(norm(ej), 0), '').lower() and len(norm(ej)) > 4
+    txt = NOMBRE_MES[mes] if completo else ABREV[mes]
+    if ej and ej == ej.lower():
+        return txt.lower()
+    if ej and ej == ej.capitalize():
+        return txt.capitalize()
+    return txt
+
+
+def detectar_periodos(ws, getval=None):
     """
-    Devuelve dict o None:
-      { 'col_actual', 'fila_mes', 'fila_anio', 'anio', 'mes', 'orden',
-        'periodos': [(col, anio, mes)], 'grupo_cols': [cols del mismo año que el actual] }
+    Detecta las columnas de período de una hoja. Devuelve dict o None:
+      col_actual   → columna del mes más reciente CON DATOS (no el último encabezado:
+                     algunas contadoras dejan creadas las columnas de todo el año)
+      periodos     → [(col, anio, mes)] todas las columnas con encabezado de mes
+      placeholders → {(anio, mes): col} columnas con encabezado pero sin datos
+      fila_mes, fila_anio, col_anio, anio, mes, orden, grupo_cols, formato_mes
+    getval(r, c) → valor cacheado (resultado de fórmula) para medir si la columna tiene datos.
     """
     anios = []   # (fila, col, anio)
     meses = []   # (fila, col, mes)
@@ -334,13 +429,12 @@ def detectar_periodos(ws):
                     meses.append((r, c, MESES[t]))
     if not meses:
         return None
-    # fila de meses más poblada
     por_fila = defaultdict(list)
     for r, c, m in meses:
         por_fila[r].append((c, m))
     fila_mes = max(por_fila, key=lambda r: len(por_fila[r]))
     cols = sorted(por_fila[fila_mes])
-    # año de cada columna: la celda de año en fila < fila_mes con col <= c más cercana
+    # año de cada columna: la celda de año (en una fila de arriba) con col <= c más cercana
     periodos = []
     anios_arriba = [(r, c, a) for r, c, a in anios if r < fila_mes]
     for c, m in cols:
@@ -350,41 +444,115 @@ def detectar_periodos(ws):
             a = cand[0][1]
         else:
             a = None
-        periodos.append((c, a, m))
-    # Si falta año en algunas columnas, inferir por secuencia
+        periodos.append([c, a, m])
     ult = None
     for i, (c, a, m) in enumerate(periodos):
         if a is None and ult is not None:
-            periodos[i] = (c, ult, m)
+            periodos[i][1] = ult
         if periodos[i][1] is not None:
             ult = periodos[i][1]
     periodos = [p for p in periodos if p[1] is not None]
     if not periodos:
         return None
     key = lambda p: p[1] * 100 + p[2]
-    mx = max(key(p) for p in periodos)
-    actuales = [p for p in periodos if key(p) == mx]
-    col_actual, anio, mes = actuales[0]
-    # orden: ¿el período a la derecha del actual es anterior? → reciente a la izquierda
-    derecha = [p for p in periodos if p[0] > col_actual]
-    orden = 'reciente_izquierda'
-    if derecha and key(min(derecha, key=lambda p: p[0])) > mx:
-        orden = 'reciente_derecha'
-    elif not derecha and any(p[0] < col_actual for p in periodos):
-        orden = 'reciente_derecha'
+
+    # orden: ¿los meses bajan hacia la derecha (reciente a la izquierda) o suben?
+    bajan = sum(1 for i in range(1, len(periodos)) if key(periodos[i]) < key(periodos[i - 1]))
+    suben = sum(1 for i in range(1, len(periodos)) if key(periodos[i]) > key(periodos[i - 1]))
+    orden = 'reciente_izquierda' if bajan >= suben else 'reciente_derecha'
+
+    # corregir años fuera de secuencia (un grupo sin encabezado de año hereda el año equivocado)
+    if orden == 'reciente_izquierda':
+        for i in range(1, len(periodos)):
+            while key(periodos[i]) > key(periodos[i - 1]) and periodos[i][1] > 1990:
+                periodos[i][1] -= 1
+    else:
+        for i in range(1, len(periodos)):
+            while key(periodos[i]) < key(periodos[i - 1]) and periodos[i][1] < 2100:
+                periodos[i][1] += 1
+    periodos = [tuple(p) for p in periodos]
+
+    # ¿qué columnas tienen datos? (números distintos de cero, con valores cacheados si hay)
+    # Columnas con datos vs. columnas dejadas vacías para meses futuros ("placeholders"):
+    #  - si en la hoja hay números TECLEADOS, una columna tiene datos si tiene alguno
+    #    (los placeholders no tienen ninguno);
+    #  - si la hoja es 100% fórmulas (ESF, NOTAS), se usan los valores calculados y se
+    #    compara contra la mediana de las columnas no vacías.
+    max_fila = min(ws.max_row, 600)
+    def contar(c, duros):
+        n = 0
+        for r in range(fila_mes + 1, max_fila + 1):
+            raw = ws.cell(r, c).value
+            v = raw if duros else (getval(r, c) if getval else raw)
+            if duros and es_formula(raw):
+                continue
+            if es_numero(v) and abs(v) > 0.004:
+                n += 1
+        return n
+    duros = {c: contar(c, True) for c, a, m in periodos}
+    if max(duros.values(), default=0) > 0:
+        conteo = duros
+    else:
+        conteo = {c: contar(c, False) for c, a, m in periodos}
+    cached = {c: contar(c, False) for c, a, m in periodos}
+    positivos = sorted(v for v in cached.values() if v > 0)
+    mediana = positivos[len(positivos) // 2] if positivos else 0
+    umbral = max(1, 0.25 * mediana)
+    # una columna tiene datos si tiene números tecleados, o si sus fórmulas dan valores a un ritmo normal
+    datos = {c: (duros[c] >= 1 or cached[c] >= umbral) for c, a, m in periodos}
+    con_datos = [p for p in periodos if datos[p[0]]] or periodos
+    mx = max(key(p) for p in con_datos)
+    info = {'fila_mes': fila_mes, 'orden': orden, 'periodos': periodos, 'datos': datos,
+            'anios_arriba': anios_arriba, 'ws': ws}
+    fijar_actual(info, mx)
+    return info
+
+
+def fijar_actual(info, periodo_global):
+    """
+    Alinea la hoja al período actual global del libro: su columna de ese período es la actual
+    (aunque esté en ceros); las columnas de períodos posteriores son placeholders (meses que la
+    contadora dejó creados vacíos). Si la hoja no llega a ese período, su actual es el último
+    anterior con datos (y el llamador la tratará como hoja vieja).
+    """
+    ws = info['ws']
+    periodos = info['periodos']
+    key = lambda p: p[1] * 100 + p[2]
+    exactas = [p for p in periodos if key(p) == periodo_global]
+    if exactas:
+        actual = exactas[0]
+    else:
+        previas = [p for p in periodos if key(p) < periodo_global and info['datos'].get(p[0])]
+        actual = max(previas, key=key) if previas else max(periodos, key=key)
+    col_actual, anio, mes = actual
+    mx = key(actual)
+    placeholders = {(a, m): c for c, a, m in periodos if key((c, a, m)) > mx}
     fila_anio = None
     col_anio = None
-    for r, c, a in anios_arriba:
+    for r, c, a in info['anios_arriba']:
         if a == anio and c <= col_actual:
             if col_anio is None or c > col_anio:
                 fila_anio, col_anio = r, c
-    grupo = sorted(p[0] for p in periodos if p[1] == anio)
-    return {
-        'col_actual': col_actual, 'fila_mes': fila_mes, 'fila_anio': fila_anio, 'col_anio': col_anio,
-        'anio': anio, 'mes': mes, 'orden': orden,
-        'periodos': periodos, 'grupo_cols': grupo,
-        'formato_mes': str(ws.cell(fila_mes, col_actual).value),
-    }
+    grupo = sorted(p[0] for p in periodos if p[1] == anio and key(p) <= mx)
+    info.update({
+        'col_actual': col_actual, 'fila_anio': fila_anio, 'col_anio': col_anio,
+        'anio': anio, 'mes': mes, 'grupo_cols': grupo, 'placeholders': placeholders,
+        'formato_mes': str(ws.cell(info['fila_mes'], col_actual).value),
+    })
+    return info
+
+
+def periodo_global(infos):
+    """Período más reciente con datos en al menos 2 hojas (o en 1 si no hay más)."""
+    conteo = defaultdict(set)
+    for nombre, p in infos.items():
+        for c, a, m in p['periodos']:
+            if p['datos'].get(c):
+                conteo[a * 100 + m].add(nombre)
+    if not conteo:
+        return max(p['anio'] * 100 + p['mes'] for p in infos.values())
+    repetidos = [k for k, v in conteo.items() if len(v) >= 2]
+    return max(repetidos) if repetidos else max(conteo)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -631,14 +799,20 @@ def aprender(esf_path, balance_path, molde_out):
 
     # Primera pasada: períodos por hoja. Solo se aprenden las hojas que van en el
     # mes más reciente del libro; las que quedaron en años viejos no se tocan.
+    candidatas = [ws.title for ws in wb.worksheets if detectar_periodos(ws)]
+    if not candidatas:
+        raise SystemExit('No se encontraron columnas de meses (ENE, FEB, ...) en ninguna hoja.')
+    vals = Valores(esf_opt, candidatas)
     periodos_por_hoja = {}
     for ws in wb.worksheets:
-        p = detectar_periodos(ws)
+        if ws.title not in candidatas:
+            continue
+        p = detectar_periodos(ws, getval=lambda r, c, _h=ws.title: vals.get(_h, r, c))
         if p:
             periodos_por_hoja[ws.title] = p
-    if not periodos_por_hoja:
-        raise SystemExit('No se encontraron columnas de meses (ENE, FEB, ...) en ninguna hoja.')
-    periodo_max = max(p['anio'] * 100 + p['mes'] for p in periodos_por_hoja.values())
+    periodo_max = periodo_global(periodos_por_hoja)
+    for p in periodos_por_hoja.values():
+        fijar_actual(p, periodo_max)
     for nombre, p in list(periodos_por_hoja.items()):
         if p['anio'] * 100 + p['mes'] != periodo_max:
             molde['hojas_omitidas'][nombre] = {'anio': p['anio'], 'mes': p['mes']}
@@ -650,7 +824,6 @@ def aprender(esf_path, balance_path, molde_out):
             f"El ESF va en {ABREV[pm_mes]} {pm_anio} pero el balance es de {ABREV.get(bal.meta['mes'], '?')} {bal.meta['anio']}. "
             f"Para aprender el molde, el balance debe ser del MISMO mes en que va el ESF ({ABREV[pm_mes]} {pm_anio}).")
     molde['periodo_base'] = {'anio': pm_anio, 'mes': pm_mes}
-    vals = Valores(esf_opt, list(periodos_por_hoja.keys()))
 
     for ws in wb.worksheets:
         p = periodos_por_hoja.get(ws.title)
@@ -836,11 +1009,14 @@ def aprender(esf_path, balance_path, molde_out):
             # cubre la cuenta padre (ej. "De clientes" = 280505 - Tis), los terceros nuevos YA están
             # incluidos ahí y no hay que insertar filas.
             puro = True
+            cods_terc = [cc for r in terc for cc in celdas[r]['regla']['codigos']]
             for r in filas:
                 c = celdas.get(r)
                 if c and c['tipo'] == 'BALANCE' and c['regla']['tipo'] in ('cuenta', 'suma', 'resto'):
                     cods = [c['regla']['codigo']] if 'codigo' in c['regla'] else c['regla']['codigos']
-                    if any(cc[:4] == cuenta_padre[:4] for cc in cods):
+                    # solo descalifica si ese renglón CUBRE a los terceros (es prefijo de sus códigos);
+                    # una subcuenta hermana (220506 junto a terceros de 220505) no cuenta
+                    if any(t.startswith(cc) for cc in cods for t in cods_terc):
                         puro = False
             bloques_out.append({'fila_total': b['fila_total'], 'inicio': b['inicio'], 'fin': b['fin'],
                                 'cuenta_padre': cuenta_padre, 'nomina': nomina, 'puro': puro,
@@ -854,6 +1030,19 @@ def aprender(esf_path, balance_path, molde_out):
             'bloques': bloques_out,
         }
         reporte['hojas'][ws.title] = dict(cont)
+
+    # ── hojas sin columnas de mes que alimentan celdas del mes actual (anexos que ella reemplaza) ──
+    anexos = defaultdict(set)
+    for nombre, h in molde['hojas'].items():
+        ws = wb[nombre]
+        for fila_s, c in h['celdas'].items():
+            if c['tipo'] in ('FORMULA', 'CADENA'):
+                v = ws.cell(int(fila_s), h['col_actual']).value
+                for hoja_ref, cc, rr, ab in referencias_de(v, nombre):
+                    if hoja_ref in wb.sheetnames and hoja_ref not in molde['hojas'] and hoja_ref not in periodos_por_hoja:
+                        anexos[hoja_ref].add(f"{nombre}!{ws.cell(int(fila_s), h['col_actual']).coordinate}")
+    reporte['anexos'] = [{'hoja': k, 'usada_en': sorted(v)[:5]} for k, v in anexos.items()]
+    molde['anexos'] = sorted(anexos)
 
     # ── cobertura: subcuentas del balance con saldo que ningún renglón usa ──
     def cubierto(cod):
@@ -1008,34 +1197,44 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 
     # 1) Re-detectar columnas actuales en el archivo (por si cambió) y planear inserciones
     plan = {}
+    vals = Valores(esf_opt, [n for n in molde['hojas'] if n in wb.sheetnames])
     for nombre, h in molde['hojas'].items():
         if nombre not in wb.sheetnames:
             reporte['advertencias'].append(f"La hoja '{nombre}' del molde no está en el archivo.")
             continue
         ws = wb[nombre]
-        p = detectar_periodos(ws)
+        p = detectar_periodos(ws, getval=lambda r, c, _h=nombre: vals.get(_h, r, c))
         if not p:
             continue
+        fijar_actual(p, base['anio'] * 100 + base['mes'])
         col = p['col_actual']
         cambia_anio = (nuevo_anio != p['anio'])
+        # ¿La contadora ya dejó creada la columna del mes nuevo (vacía)? → modo LLENAR, sin insertar
+        col_ph = p['placeholders'].get((nuevo_anio, nuevo_mes))
+        if col_ph is not None:
+            plan[nombre] = {'p': p, 'col_vieja': col, 'n': 0, 'cambia_anio': False, 'ins_en': col_ph,
+                            'modo': 'llenar', 'col_mes': col_ph, 'col_sep': None, 'col_ant': col}
+            continue
         if p['orden'] == 'reciente_izquierda':
             col_nueva = col
             n = 2 if cambia_anio else 1       # columna separadora + mes nuevo
         else:
             col_nueva = col + 1
             n = 2 if cambia_anio else 1
-        plan[nombre] = {'p': p, 'col_vieja': col, 'col_nueva': col_nueva if p['orden'] == 'reciente_izquierda' else col_nueva + (1 if cambia_anio else 0),
-                        'n': n, 'cambia_anio': cambia_anio, 'ins_en': col_nueva}
+        plan[nombre] = {'p': p, 'col_vieja': col, 'n': n, 'cambia_anio': cambia_anio, 'ins_en': col_nueva, 'modo': 'insertar'}
 
     # 2) Insertar columnas y reescribir TODAS las fórmulas del libro
-    ins_cols = {nombre: [pl['ins_en']] * pl['n'] for nombre, pl in plan.items()}
+    ins_cols = {nombre: [pl['ins_en']] * pl['n'] for nombre, pl in plan.items() if pl['n']}
     for nombre, pl in plan.items():
-        insertar_columna_hoja(wb, wb[nombre], pl['ins_en'], pl['n'])
+        if pl['n']:
+            insertar_columna_hoja(wb, wb[nombre], pl['ins_en'], pl['n'])
     reescribir_todo(wb, ins_cols, {})
 
     # posición de las columnas después de insertar
     for nombre, pl in plan.items():
         p = pl['p']
+        if pl['modo'] == 'llenar':
+            continue
         if p['orden'] == 'reciente_izquierda':
             pl['col_mes'] = pl['ins_en']                       # mes nuevo
             pl['col_sep'] = pl['ins_en'] + 1 if pl['cambia_anio'] else None
@@ -1077,22 +1276,18 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 
         # encabezados
         fm = p['fila_mes']
-        mes_txt = ABREV[nuevo_mes]
-        ref_mes = str(ws.cell(fm, ca).value or '')
-        if ref_mes and ref_mes == ref_mes.lower():
-            mes_txt = mes_txt.lower()
-        elif ref_mes and ref_mes == ref_mes.capitalize():
-            mes_txt = mes_txt.capitalize()
-        ws.cell(fm, cm).value = mes_txt
+        mes_txt = texto_mes(nuevo_mes, ws.cell(fm, ca).value)
+        if pl['modo'] == 'insertar':
+            ws.cell(fm, cm).value = mes_txt
         # textos de encabezado que mencionan el mes anterior ("ACUMULADO A ABR") → mes nuevo
         viejo = ABREV[p['mes']]
-        pat_mes = re.compile(r'\b' + viejo + r'\b', re.I)
+        pat_mes = re.compile(r'\b(' + NOMBRE_MES[p['mes']] + '|' + viejo + r')\b', re.I)
         for rr in range(max(1, fm - 3), fm + 2):
             for cc in range(1, min(ws.max_column, 80) + 1):
                 vv = ws.cell(rr, cc).value
-                if isinstance(vv, str) and not es_formula(vv) and cc != cm and pat_mes.search(vv) and norm(vv) != viejo.lower():
+                if isinstance(vv, str) and not es_formula(vv) and cc != cm and pat_mes.search(vv) and norm(vv) not in MESES:
                     ws.cell(rr, cc).value = pat_mes.sub(mes_txt.upper() if vv.isupper() else mes_txt, vv)
-        if p['fila_anio']:
+        if p['fila_anio'] and pl['modo'] == 'insertar':
             fa = p['fila_anio']
             # la celda de año del grupo actual se corrió junto con las columnas
             col_anio_ahora = p['col_anio'] + (pl['n'] if p['col_anio'] >= pl['ins_en'] else 0)
@@ -1247,7 +1442,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
         h['anio'], h['mes'] = nuevo_anio, nuevo_mes
         h['fila_anio'] = p['fila_anio']
         h['col_anio'] = cm if (pl['cambia_anio'] or (p['orden'] == 'reciente_izquierda')) else (p['col_anio'] or cm)
-        h['grupo_cols'] = ([cm] if pl['cambia_anio'] else [cm] + [c + pl['n'] for c in p['grupo_cols']])
+        h['grupo_cols'] = ([cm] if pl['cambia_anio'] else sorted(set([cm] + [c + pl['n'] for c in p['grupo_cols']])))
+        reporte['hojas'][nombre]['modo'] = pl['modo']
 
     # 5) cobertura del balance nuevo
     codigos_usados = set()
@@ -1268,6 +1464,10 @@ def extender(esf_path, molde_path, balance_path, salida_path):
         if len(cod) == 6 and abs(v) > TOL and cod[0] in '123' and not cubierto(cod):
             reporte['sin_ubicar'].append({'codigo': cod, 'nombre': bal.nombre.get(cod, ''), 'saldo': round(v, 2)})
 
+    for hoja in molde.get('anexos', []):
+        reporte['advertencias'].append(
+            f"La hoja '{hoja}' no tiene columnas de meses (es un anexo que se reemplaza cada mes) y alimenta el ESF. "
+            f"El sistema NO la actualiza: pega ahí el anexo de {ABREV[nuevo_mes]} {nuevo_anio} y revisa los renglones que dependen de ella.")
     molde['periodo_base'] = {'anio': nuevo_anio, 'mes': nuevo_mes}
     wb.save(salida_path)
     try:
