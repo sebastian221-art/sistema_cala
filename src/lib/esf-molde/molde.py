@@ -1,0 +1,1297 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+molde.py — Motor "ESF por molde" de CALA.
+
+Filosofía: el sistema NO decide la estructura del ESF. La copia de la
+contadora. Ella sube su ESF histórico (ya formulado) y cada mes solo
+se le agrega la columna del mes nuevo.
+
+Dos comandos:
+
+  aprender  <esf.xlsx> <balance.json> <molde_out.json>
+      Analiza el ESF SIN modificarlo. Para cada hoja con columnas de mes,
+      toma la columna del mes más reciente y clasifica cada celda:
+        FORMULA   → fórmula que no mira el mes anterior (estructura)
+        CADENA    → fórmula que referencia la columna del mes anterior
+        BALANCE   → número duro que cruza con el balance (regla aprendida)
+        CONSTANTE → número duro igual en los meses anteriores (capital, etc.)
+        MANUAL    → número duro que no cruza con nada (criterio de ella)
+      Imprime por stdout un JSON con el molde y el reporte de cruce.
+
+  extender  <esf.xlsx> <molde.json> <balance_nuevo.json> <salida.xlsx>
+      Inserta la columna del mes nuevo en cada hoja (corriendo TODAS las
+      referencias cruzadas entre hojas), clona fórmulas y estilos, escribe
+      los valores BALANCE desde el balance nuevo, arrastra CONSTANTE/MANUAL,
+      inserta filas para terceros nuevos, y escribe salida.xlsx.
+      Imprime por stdout un JSON con el reporte de revisión.
+
+El balance.json lo produce balanceAJson.ts (usa el parser existente).
+Dependencias: openpyxl.
+"""
+import sys, json, re, copy, unicodedata, zipfile, shutil, os, tempfile
+from collections import defaultdict
+from itertools import combinations
+
+import openpyxl
+from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.formula.tokenizer import Tokenizer, Token
+
+# ─────────────────────────────────────────────────────────────────────────
+# Constantes
+# ─────────────────────────────────────────────────────────────────────────
+MESES = {
+    'ene': 1, 'enero': 1, 'feb': 2, 'febrero': 2, 'mar': 3, 'marzo': 3,
+    'abr': 4, 'abril': 4, 'may': 5, 'mayo': 5, 'jun': 6, 'junio': 6,
+    'jul': 7, 'julio': 7, 'ago': 8, 'agos': 8, 'agosto': 8,
+    'sep': 9, 'sept': 9, 'septiembre': 9, 'oct': 10, 'octubre': 10,
+    'nov': 11, 'noviembre': 11, 'dic': 12, 'diciembre': 12,
+}
+ABREV = {1: 'ENE', 2: 'FEB', 3: 'MAR', 4: 'ABR', 5: 'MAY', 6: 'JUN',
+         7: 'JUL', 8: 'AGO', 9: 'SEP', 10: 'OCT', 11: 'NOV', 12: 'DIC'}
+TOL = 1.0            # tolerancia en pesos para cruzar valores
+MAX_FILAS = 6000     # tope de filas a escanear por hoja (hay hojas con 1M de filas formateadas)
+MAX_HEADER = 12      # filas donde se buscan encabezados de mes/año
+
+
+def norm(s):
+    if s is None:
+        return ''
+    s = unicodedata.normalize('NFD', str(s)).encode('ascii', 'ignore').decode()
+    return re.sub(r'\s+', ' ', s).strip().lower()
+
+
+def es_formula(v):
+    return isinstance(v, str) and v.startswith('=')
+
+
+def es_numero(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Balance: índice de cuentas y terceros
+# ─────────────────────────────────────────────────────────────────────────
+class Balance:
+    def __init__(self, data):
+        self.meta = {k: data.get(k) for k in ('empresa', 'nit', 'periodo', 'mes', 'anio', 'formato')}
+        self.sf = defaultdict(float)      # codigo → saldo final (suma de filas con ese código, sin terceros)
+        self.mov = defaultdict(float)     # codigo → movimiento neto (debito - credito) del mes
+        self.nombre = {}                  # codigo → nombre de cuenta
+        self.terceros = defaultdict(dict) # codigo(auxiliar) → {nit: {'nombre','sf','mov'}}
+        self.codigos_tercero_por_nit = defaultdict(set)
+        for c in data['cuentas']:
+            cod = str(c['codigo'])
+            sf = float(c.get('saldoFinal') or 0)
+            mv = float(c.get('movDebito') or 0) - float(c.get('movCredito') or 0)
+            nit = (c.get('nit') or '').strip()
+            if c['nivel'] in ('Auxiliar', 'Subauxiliar') and nit:
+                t = self.terceros[cod].setdefault(nit, {'nombre': c.get('tercero') or '', 'sf': 0.0, 'mov': 0.0})
+                t['sf'] += sf
+                t['mov'] += mv
+                self.codigos_tercero_por_nit[nit].add(cod)
+                # el auxiliar agregado (suma de sus terceros) también es un código consultable
+                self.sf[cod] += sf
+                self.mov[cod] += mv
+                self.nombre.setdefault(cod, c.get('nombre') or '')
+            else:
+                self.sf[cod] += sf
+                self.mov[cod] += mv
+                self.nombre[cod] = c.get('nombre') or ''
+        # índices por valor (clave = pesos enteros; la verificación fina usa TOL)
+        self.por_valor_sf = defaultdict(list)
+        self.por_valor_mov = defaultdict(list)
+        for cod, v in self.sf.items():
+            if abs(v) > 0.004:
+                self.por_valor_sf[int(round(abs(v)))].append(cod)
+        for cod, v in self.mov.items():
+            if abs(v) > 0.004:
+                self.por_valor_mov[int(round(abs(v)))].append(cod)
+        self.terceros_por_valor = defaultdict(list)
+        for cod, d in self.terceros.items():
+            for nit, t in d.items():
+                if abs(t['sf']) > 0.004:
+                    self.terceros_por_valor[int(round(abs(t['sf'])))].append((cod, nit))
+
+    # ── consultas ──
+    def valor(self, regla):
+        """Evalúa una regla aprendida contra este balance. Devuelve (valor, encontrado)."""
+        tipo = regla['tipo']
+        campo = regla.get('campo', 'sf')
+        signo = regla.get('signo', 1)
+        src = self.sf if campo == 'sf' else self.mov
+        if tipo == 'cuenta':
+            cod = regla['codigo']
+            return signo * src.get(cod, 0.0), cod in src
+        if tipo == 'suma':
+            total, alguno = 0.0, False
+            for cod in regla['codigos']:
+                if cod in src:
+                    alguno = True
+                    total += src[cod]
+            return signo * total, alguno
+        if tipo == 'tercero':
+            total, alguno = 0.0, False
+            for cod in regla['codigos']:
+                t = self.terceros.get(cod, {}).get(regla['nit'])
+                if t:
+                    alguno = True
+                    total += t[campo]
+            return signo * total, alguno
+        if tipo == 'resto':
+            # cuenta menos los terceros que ya tienen su propio renglón
+            base = src.get(regla['codigo'], 0.0)
+            for nit in regla['excluir_nits']:
+                for cod in self.terceros:
+                    if cod.startswith(regla['codigo']):
+                        t = self.terceros[cod].get(nit)
+                        if t:
+                            base -= t[campo]
+            return signo * base, regla['codigo'] in src
+        return 0.0, False
+
+    def buscar_valor(self, v, preferir_mov=False):
+        """Busca qué código(s) del balance explican el valor v. Devuelve lista de reglas candidatas."""
+        k = int(round(abs(v)))
+        cands = []
+        ordenes = [('mov', self.por_valor_mov), ('sf', self.por_valor_sf)] if preferir_mov else [('sf', self.por_valor_sf), ('mov', self.por_valor_mov)]
+        for campo, idx in ordenes:
+            for kk in (k, k - 1, k + 1):
+                for cod in idx.get(kk, []):
+                    src = self.sf if campo == 'sf' else self.mov
+                    if abs(abs(src[cod]) - abs(v)) <= TOL:
+                        signo = 1 if (src[cod] >= 0) == (v >= 0) else -1
+                        cands.append({'tipo': 'cuenta', 'codigo': cod, 'campo': campo, 'signo': signo})
+            if cands:
+                break
+        return cands
+
+    def buscar_tercero(self, v, etiqueta=''):
+        k = int(round(abs(v)))
+        cands = []
+        for kk in (k, k - 1, k + 1):
+            for cod, nit in self.terceros_por_valor.get(kk, []):
+                t = self.terceros[cod][nit]
+                if abs(abs(t['sf']) - abs(v)) <= TOL:
+                    signo = 1 if (t['sf'] >= 0) == (v >= 0) else -1
+                    cands.append({'tipo': 'tercero', 'codigos': [cod], 'nit': nit, 'campo': 'sf',
+                                  'signo': signo, 'nombre': t['nombre'], 'score': similitud(etiqueta, t['nombre'])})
+        cands.sort(key=lambda c: -c['score'])
+        return cands
+
+    def buscar_suma(self, v, max_items=3):
+        """Combinaciones de 2-3 cuentas del mismo grupo (2 dígitos) o misma clase a nivel cuenta (4 díg)."""
+        res = []
+        for campo, src in (('sf', self.sf),):
+            # candidatos: cuentas de 4 y 6 dígitos con saldo
+            por_grupo = defaultdict(list)
+            for cod, val in src.items():
+                if len(cod) in (4, 6, 8) and abs(val) > 0.004:
+                    por_grupo[(cod[:2], len(cod))].append(cod)
+            for (grp, ln), cods in por_grupo.items():
+                if len(cods) > 60:
+                    continue
+                for n in (2, 3):
+                    if n > max_items:
+                        break
+                    for combo in combinations(cods, n):
+                        s = sum(src[c] for c in combo)
+                        if abs(abs(s) - abs(v)) <= TOL:
+                            signo = 1 if (s >= 0) == (v >= 0) else -1
+                            res.append({'tipo': 'suma', 'codigos': list(combo), 'campo': campo, 'signo': signo})
+                    if res:
+                        break
+                if res:
+                    break
+        return res
+
+    def terceros_bajo(self, codigo):
+        """Todos los terceros cuyo código auxiliar empieza por `codigo`: {nit: {'nombre','sf','mov','codigos':[...]}}."""
+        out = {}
+        for cod, d in self.terceros.items():
+            if cod.startswith(codigo):
+                for nit, t in d.items():
+                    o = out.setdefault(nit, {'nombre': t['nombre'], 'sf': 0.0, 'mov': 0.0, 'codigos': []})
+                    o['sf'] += t['sf']
+                    o['mov'] += t['mov']
+                    o['codigos'].append(cod)
+        return out
+
+
+def similitud(a, b):
+    """Similitud simple entre nombres (tokens en común). 0..1"""
+    ta = set(t for t in norm(a).replace('.', ' ').split() if len(t) > 1 and t not in ('sas', 's', 'a', 'de', 'y', 'la', 'el', 'ltda'))
+    tb = set(t for t in norm(b).replace('.', ' ').split() if len(t) > 1 and t not in ('sas', 's', 'a', 'de', 'y', 'la', 'el', 'ltda'))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Optimización del archivo: hojas con cientos de miles de filas VACÍAS con
+# formato (p.ej. una hoja oculta de 62 MB) hacen que openpyxl tarde minutos.
+# Se quitan las filas sin ningún valor/fórmula de las hojas gigantes.
+# ─────────────────────────────────────────────────────────────────────────
+ROW_RE_XML = re.compile(rb'<row\b[^>]*?(?:/>|>.*?</row>)', re.S)
+
+
+def _fila_vacia(m):
+    s = m.group(0)
+    return b'<v>' not in s and b'<f' not in s and b'<is>' not in s
+
+
+def optimizar_xlsx(src, dst, umbral=3_000_000):
+    """Copia src → dst quitando filas vacías de las hojas cuyo XML pese más de `umbral` bytes."""
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith('xl/worksheets/sheet') and item.filename.endswith('.xml') and len(data) > umbral:
+                data = ROW_RE_XML.sub(lambda m: b'' if _fila_vacia(m) else m.group(0), data)
+            zout.writestr(item, data)
+
+
+class Valores:
+    """Valores cacheados (resultado de fórmulas) leídos en modo read_only, solo hasta MAX_FILAS."""
+    def __init__(self, path, hojas):
+        self.v = {}
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        for nombre in hojas:
+            if nombre not in wb.sheetnames:
+                continue
+            ws = wb[nombre]
+            d = {}
+            for r, fila in enumerate(ws.iter_rows(min_row=1, max_row=MAX_FILAS, values_only=True), start=1):
+                for c, val in enumerate(fila, start=1):
+                    if val is not None:
+                        d[(r, c)] = val
+            self.v[nombre] = d
+        wb.close()
+
+    def get(self, hoja, r, c):
+        return self.v.get(hoja, {}).get((r, c))
+
+
+def constantes_sueltas(formula):
+    """
+    Números 'sueltos' dentro de una fórmula: sumandos/restandos literales, p.ej.
+    =28614668+200000-4276000 → [28614668, 200000, 4276000]; =-((C7/5)/12)+D8-3 → [3].
+    Devuelve lista de (indice_token, valor_float, signo_previo).
+    """
+    try:
+        toks = Tokenizer(formula).items
+    except Exception:
+        return []
+    out = []
+    for i, t in enumerate(toks):
+        if t.type == Token.OPERAND and t.subtype == Token.NUMBER:
+            prev = toks[i - 1] if i > 0 else None
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            prev_ok = prev is None or (prev.type in (Token.OP_IN, Token.OP_PRE) and prev.value in ('+', '-'))
+            nxt_ok = nxt is None or (nxt.type == Token.OP_IN and nxt.value in ('+', '-')) or nxt.type == Token.PAREN
+            if prev_ok and nxt_ok:
+                try:
+                    val = float(t.value)
+                except ValueError:
+                    continue
+                signo = -1 if (prev is not None and prev.value == '-') else 1
+                out.append((i, val, signo))
+    return out
+
+
+def formula_con_placeholder(formula, idx):
+    toks = Tokenizer(formula).items
+    partes = ['=']
+    for i, t in enumerate(toks):
+        partes.append('{V}' if i == idx else t.value)
+    return ''.join(partes)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Detección de columnas de período en cada hoja
+# ─────────────────────────────────────────────────────────────────────────
+def detectar_periodos(ws):
+    """
+    Devuelve dict o None:
+      { 'col_actual', 'fila_mes', 'fila_anio', 'anio', 'mes', 'orden',
+        'periodos': [(col, anio, mes)], 'grupo_cols': [cols del mismo año que el actual] }
+    """
+    anios = []   # (fila, col, anio)
+    meses = []   # (fila, col, mes)
+    max_r = min(ws.max_row, MAX_HEADER)
+    max_c = min(ws.max_column, 80)
+    for r in range(1, max_r + 1):
+        for c in range(1, max_c + 1):
+            v = ws.cell(r, c).value
+            if v is None or es_formula(v):
+                continue
+            if es_numero(v) and 2000 <= v <= 2100 and float(v).is_integer():
+                anios.append((r, c, int(v)))
+            elif isinstance(v, str):
+                t = norm(v)
+                if re.fullmatch(r'(19|20)\d{2}', t):
+                    anios.append((r, c, int(t)))
+                elif t in MESES:
+                    meses.append((r, c, MESES[t]))
+    if not meses:
+        return None
+    # fila de meses más poblada
+    por_fila = defaultdict(list)
+    for r, c, m in meses:
+        por_fila[r].append((c, m))
+    fila_mes = max(por_fila, key=lambda r: len(por_fila[r]))
+    cols = sorted(por_fila[fila_mes])
+    # año de cada columna: la celda de año en fila < fila_mes con col <= c más cercana
+    periodos = []
+    anios_arriba = [(r, c, a) for r, c, a in anios if r < fila_mes]
+    for c, m in cols:
+        cand = [(cc, a, r) for r, cc, a in anios_arriba if cc <= c]
+        if cand:
+            cand.sort(key=lambda x: (-x[0], -x[2]))
+            a = cand[0][1]
+        else:
+            a = None
+        periodos.append((c, a, m))
+    # Si falta año en algunas columnas, inferir por secuencia
+    ult = None
+    for i, (c, a, m) in enumerate(periodos):
+        if a is None and ult is not None:
+            periodos[i] = (c, ult, m)
+        if periodos[i][1] is not None:
+            ult = periodos[i][1]
+    periodos = [p for p in periodos if p[1] is not None]
+    if not periodos:
+        return None
+    key = lambda p: p[1] * 100 + p[2]
+    mx = max(key(p) for p in periodos)
+    actuales = [p for p in periodos if key(p) == mx]
+    col_actual, anio, mes = actuales[0]
+    # orden: ¿el período a la derecha del actual es anterior? → reciente a la izquierda
+    derecha = [p for p in periodos if p[0] > col_actual]
+    orden = 'reciente_izquierda'
+    if derecha and key(min(derecha, key=lambda p: p[0])) > mx:
+        orden = 'reciente_derecha'
+    elif not derecha and any(p[0] < col_actual for p in periodos):
+        orden = 'reciente_derecha'
+    fila_anio = None
+    col_anio = None
+    for r, c, a in anios_arriba:
+        if a == anio and c <= col_actual:
+            if col_anio is None or c > col_anio:
+                fila_anio, col_anio = r, c
+    grupo = sorted(p[0] for p in periodos if p[1] == anio)
+    return {
+        'col_actual': col_actual, 'fila_mes': fila_mes, 'fila_anio': fila_anio, 'col_anio': col_anio,
+        'anio': anio, 'mes': mes, 'orden': orden,
+        'periodos': periodos, 'grupo_cols': grupo,
+        'formato_mes': str(ws.cell(fila_mes, col_actual).value),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Manipulación de fórmulas (desplazar referencias al insertar columnas/filas)
+# ─────────────────────────────────────────────────────────────────────────
+REF_RE = re.compile(r'^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$')
+COL_RE = re.compile(r'^(\$?)([A-Za-z]{1,3})$')
+ROW_RE = re.compile(r'^(\$?)(\d+)$')
+
+
+def _split_sheet(ref):
+    """'Hoja'!A1:B2 → ('Hoja', 'A1:B2'); A1 → (None, 'A1')"""
+    if '!' in ref:
+        i = ref.rfind('!')
+        hoja = ref[:i]
+        if hoja.startswith("'") and hoja.endswith("'"):
+            hoja = hoja[1:-1].replace("''", "'")
+        return hoja, ref[i + 1:]
+    return None, ref
+
+
+def _shift_col(letras, abs_, ins_cols, expandir_fin=False):
+    c = column_index_from_string(letras.upper())
+    n = sum(1 for ic in ins_cols if c >= ic)
+    return get_column_letter(c + n) if n else letras.upper()
+
+
+def _shift_row(num, ins_rows):
+    r = int(num)
+    n = sum(k for (ir, k) in ins_rows if r >= ir)
+    return str(r + n)
+
+
+def desplazar_ref(ref, ins_cols, ins_rows):
+    """Desplaza una referencia (sin hoja) según columnas/filas insertadas en ESA hoja."""
+    if ref.startswith('#'):
+        return ref
+    partes = ref.split(':')
+    if len(partes) == 1:
+        m = REF_RE.match(ref)
+        if m:
+            return f"{m.group(1)}{_shift_col(m.group(2), m.group(1), ins_cols)}{m.group(3)}{_shift_row(m.group(4), ins_rows)}"
+        return ref
+    if len(partes) != 2:
+        return ref
+    a, b = partes
+    ma, mb = REF_RE.match(a), REF_RE.match(b)
+    if ma and mb:
+        ca, cb = column_index_from_string(ma.group(2).upper()), column_index_from_string(mb.group(2).upper())
+        ra, rb = int(ma.group(4)), int(mb.group(4))
+        # columnas: un rango horizontal que contiene la inserción se EXPANDE (Excel) y además,
+        # si la inserción cae exactamente en su inicio, también se expande (queremos que el mes
+        # nuevo quede dentro del acumulado, p.ej. SUM(C8:F8) con mes nuevo en C).
+        na = sum(1 for ic in ins_cols if ca >= ic)
+        nb = sum(1 for ic in ins_cols if cb >= ic)
+        if ca < cb:
+            na = sum(1 for ic in ins_cols if ca > ic)   # inicio no se corre si inserción == inicio
+        # filas: igual lógica para rangos verticales
+        ka = sum(k for (ir, k) in ins_rows if ra >= ir)
+        kb = sum(k for (ir, k) in ins_rows if rb >= ir)
+        if ra < rb:
+            ka = sum(k for (ir, k) in ins_rows if ra > ir)
+        return (f"{ma.group(1)}{get_column_letter(ca + na)}{ma.group(3)}{ra + ka}:"
+                f"{mb.group(1)}{get_column_letter(cb + nb)}{mb.group(3)}{rb + kb}")
+    # rangos de columna completa A:A o fila completa 1:1
+    ca_, cb_ = COL_RE.match(a), COL_RE.match(b)
+    if ca_ and cb_:
+        return f"{ca_.group(1)}{_shift_col(ca_.group(2), '', ins_cols)}:{cb_.group(1)}{_shift_col(cb_.group(2), '', ins_cols)}"
+    ra_, rb_ = ROW_RE.match(a), ROW_RE.match(b)
+    if ra_ and rb_:
+        return f"{ra_.group(1)}{_shift_row(ra_.group(2), ins_rows)}:{rb_.group(1)}{_shift_row(rb_.group(2), ins_rows)}"
+    return ref
+
+
+def _quote(hoja):
+    if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', hoja):
+        return hoja
+    return "'" + hoja.replace("'", "''") + "'"
+
+
+def reescribir_formula(formula, hoja_actual, ins_cols_por_hoja, ins_rows_por_hoja):
+    """Reescribe todas las referencias de una fórmula según inserciones por hoja."""
+    if not es_formula(formula):
+        return formula
+    try:
+        tok = Tokenizer(formula)
+    except Exception:
+        return formula
+    out = ['=']
+    for t in tok.items:
+        if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+            hoja, ref = _split_sheet(t.value)
+            if hoja is not None and '[' in hoja:      # libro externo: no tocar
+                out.append(t.value)
+                continue
+            h = hoja if hoja is not None else hoja_actual
+            ic = ins_cols_por_hoja.get(h, [])
+            ir = ins_rows_por_hoja.get(h, [])
+            if not ic and not ir:
+                out.append(t.value)
+                continue
+            nuevo = desplazar_ref(ref, ic, ir)
+            out.append((_quote(hoja) + '!' + nuevo) if hoja is not None else nuevo)
+        else:
+            out.append(t.value)
+    return ''.join(out)
+
+
+def trasladar_formula(formula, hoja_actual, col_origen, col_destino, col_min_por_hoja):
+    """
+    Clona la fórmula de la columna origen (mes anterior) a la columna destino (mes nuevo).
+    Solo desplaza las referencias RELATIVAS cuya columna está dentro del área de meses de la
+    hoja referenciada (col >= col_min de esa hoja). Las referencias a columnas de etiquetas
+    (A, B...) se dejan igual, como haría la contadora al copiar.
+    """
+    delta = col_destino - col_origen
+    if not es_formula(formula):
+        return formula
+    try:
+        tok = Tokenizer(formula)
+    except Exception:
+        return formula
+    out = ['=']
+    for t in tok.items:
+        if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+            hoja, ref = _split_sheet(t.value)
+            if hoja is not None and '[' in hoja:
+                out.append(t.value)
+                continue
+            h = hoja if hoja is not None else hoja_actual
+            col_min = col_min_por_hoja.get(h)
+            if col_min is None or ref.startswith('#'):
+                out.append(t.value)
+                continue
+
+            def mov(part):
+                m = REF_RE.match(part)
+                if not m:
+                    return part
+                if m.group(1) == '$':
+                    return part
+                c = column_index_from_string(m.group(2).upper())
+                if c >= col_min and c + delta >= 1:
+                    return f"{get_column_letter(c + delta)}{m.group(3)}{m.group(4)}"
+                return part
+            partes = ref.split(':')
+            nuevo = ':'.join(mov(p) for p in partes)
+            out.append((_quote(hoja) + '!' + nuevo) if hoja is not None else nuevo)
+        else:
+            out.append(t.value)
+    return ''.join(out)
+
+
+def referencias_de(formula, hoja_actual):
+    """Lista de (hoja, col, fila) referenciadas (solo celdas simples y extremos de rango)."""
+    refs = []
+    if not es_formula(formula):
+        return refs
+    try:
+        tok = Tokenizer(formula)
+    except Exception:
+        return refs
+    for t in tok.items:
+        if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+            hoja, ref = _split_sheet(t.value)
+            if hoja is not None and '[' in hoja:
+                continue
+            h = hoja if hoja is not None else hoja_actual
+            for part in ref.split(':'):
+                m = REF_RE.match(part)
+                if m:
+                    refs.append((h, column_index_from_string(m.group(2).upper()), int(m.group(4)), m.group(1) == '$'))
+    return refs
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FASE A — APRENDER
+# ─────────────────────────────────────────────────────────────────────────
+def columna_etiqueta(ws, fila, col_actual):
+    """Texto de etiqueta del renglón: primera celda con texto a la izquierda de la columna actual."""
+    for c in range(1, col_actual):
+        v = ws.cell(fila, c).value
+        if isinstance(v, str) and v.strip() and not es_formula(v):
+            return v.strip()
+    return ''
+
+
+def etiqueta_valor(vals, ws, fila, col_actual):
+    """Etiqueta evaluada (si la etiqueta es fórmula, usa el valor cacheado)."""
+    for c in range(1, col_actual):
+        v = ws.cell(fila, c).value
+        if v is None:
+            continue
+        if es_formula(v):
+            vv = vals.get(ws.title, fila, c)
+            if isinstance(vv, str) and vv.strip():
+                return vv.strip()
+        elif isinstance(v, str) and v.strip():
+            return v.strip()
+    return ''
+
+
+def etiqueta_valor_ws(ws, fila, col_actual):
+    for c in range(1, col_actual):
+        v = ws.cell(fila, c).value
+        if isinstance(v, str) and v.strip() and not es_formula(v):
+            return v.strip()
+    return ''
+
+
+def detectar_bloques(ws, col_actual, max_fila):
+    """Bloques = rangos verticales sumados por una fórmula SUM(Xa:Xb) en la columna actual."""
+    bloques = []
+    letra = get_column_letter(col_actual)
+    pat = re.compile(r'SUM\(\$?' + letra + r'\$?(\d+):\$?' + letra + r'\$?(\d+)\)', re.I)
+    for r in range(1, max_fila + 1):
+        v = ws.cell(r, col_actual).value
+        if es_formula(v):
+            for m in pat.finditer(v):
+                a, b = int(m.group(1)), int(m.group(2))
+                # el total puede estar arriba (fila 8 suma 9:40) o abajo del detalle
+                if a <= b and not (a <= r <= b):
+                    bloques.append({'fila_total': r, 'inicio': a, 'fin': b})
+    return bloques
+
+
+def cargar_optimizado(esf_path):
+    """Devuelve ruta a una copia optimizada (filas vacías de hojas gigantes removidas)."""
+    tmp = tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False)
+    tmp.close()
+    optimizar_xlsx(esf_path, tmp.name)
+    return tmp.name
+
+
+def aprender(esf_path, balance_path, molde_out):
+    bal = Balance(json.load(open(balance_path, encoding='utf-8')))
+    esf_opt = cargar_optimizado(esf_path)
+    wb = openpyxl.load_workbook(esf_opt)                       # fórmulas
+    molde = {'version': 1, 'empresa': bal.meta['empresa'], 'nit': bal.meta['nit'],
+             'periodo_base': {'anio': bal.meta['anio'], 'mes': bal.meta['mes']},
+             'hojas': {}, 'hojas_omitidas': {}, 'orden_hojas': wb.sheetnames}
+    reporte = {'hojas': {}, 'hojas_omitidas': {}, 'manual': [], 'constante': [], 'dudosos': [], 'sin_ubicar': [], 'resumen': {}}
+    codigos_usados = set()
+
+    # Primera pasada: períodos por hoja. Solo se aprenden las hojas que van en el
+    # mes más reciente del libro; las que quedaron en años viejos no se tocan.
+    periodos_por_hoja = {}
+    for ws in wb.worksheets:
+        p = detectar_periodos(ws)
+        if p:
+            periodos_por_hoja[ws.title] = p
+    if not periodos_por_hoja:
+        raise SystemExit('No se encontraron columnas de meses (ENE, FEB, ...) en ninguna hoja.')
+    periodo_max = max(p['anio'] * 100 + p['mes'] for p in periodos_por_hoja.values())
+    for nombre, p in list(periodos_por_hoja.items()):
+        if p['anio'] * 100 + p['mes'] != periodo_max:
+            molde['hojas_omitidas'][nombre] = {'anio': p['anio'], 'mes': p['mes']}
+            reporte['hojas_omitidas'][nombre] = f"va en {ABREV[p['mes']]} {p['anio']} (no se actualiza mes a mes)"
+            del periodos_por_hoja[nombre]
+    pm_anio, pm_mes = divmod(periodo_max, 100)
+    if (pm_anio, pm_mes) != (bal.meta['anio'], bal.meta['mes']) and bal.meta['mes']:
+        reporte.setdefault('advertencias', []).append(
+            f"El ESF va en {ABREV[pm_mes]} {pm_anio} pero el balance es de {ABREV.get(bal.meta['mes'], '?')} {bal.meta['anio']}. "
+            f"Para aprender el mapeo deben ser del MISMO mes.")
+    molde['periodo_base'] = {'anio': pm_anio, 'mes': pm_mes}
+    vals = Valores(esf_opt, list(periodos_por_hoja.keys()))
+
+    for ws in wb.worksheets:
+        p = periodos_por_hoja.get(ws.title)
+        if not p:
+            continue
+        col = p['col_actual']
+        max_fila = min(ws.max_row, MAX_FILAS)
+        es_eri = 'ER' in ws.title.upper().split() or ws.title.upper().startswith('ERI') or 'NOTAS ER' in ws.title.upper()
+        bloques = detectar_bloques(ws, col, max_fila)
+        celdas = {}
+        cont = defaultdict(int)
+        # columnas anteriores del mismo año (para detectar constantes)
+        anteriores = [c for c in p['grupo_cols'] if (c > col if p['orden'] == 'reciente_izquierda' else c < col)]
+        anteriores = sorted(anteriores, key=lambda c: abs(c - col))[:3]
+
+        for r in range(1, max_fila + 1):
+            cell = ws.cell(r, col)
+            v = cell.value
+            if v is None or r == p['fila_mes'] or r == p['fila_anio']:
+                continue
+            etiqueta = etiqueta_valor(vals, ws, r, col)
+            if es_formula(v):
+                refs = referencias_de(v, ws.title)
+                mira_anterior = any(h == ws.title and (cc == col + 1 if p['orden'] == 'reciente_izquierda' else cc == col - 1) for h, cc, rr, ab in refs)
+                sueltas = [(i, val, sg) for i, val, sg in constantes_sueltas(v) if abs(val) >= 100]
+                # ¿Alguna constante suelta ES un valor del balance? (ej. =28614668+200000-4276000)
+                # → se trata como BALANCE con ajuste: el número se actualiza, el ajuste se conserva y se avisa.
+                regla_emb = None
+                if sueltas:
+                    for i, val, sg in sueltas:
+                        cands = bal.buscar_valor(sg * val, preferir_mov=es_eri)
+                        if cands:
+                            cands.sort(key=lambda c: (c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
+                            regla_emb = (i, cands[0])
+                            break
+                if regla_emb is not None:
+                    i, regla = regla_emb
+                    celdas[r] = {'tipo': 'BALANCE', 'etiqueta': etiqueta, 'regla': regla,
+                                 'valor_base': v, 'ajuste': formula_con_placeholder(v, i), 'ajuste_idx': i,
+                                 'ajuste_signo': sg}
+                    codigos_usados.add(regla['codigo'])
+                    cont['BALANCE'] += 1
+                    reporte['manual'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                              'motivo': f"cruza con {regla['codigo']} pero tiene ajuste a mano; se conserva el ajuste"})
+                    continue
+                tipo = 'CADENA' if mira_anterior else 'FORMULA'
+                celdas[r] = {'tipo': tipo, 'etiqueta': etiqueta}
+                if sueltas and not re.fullmatch(r'=[+\-]?\d+(\.\d+)?', v):
+                    # fórmula con número suelto adentro (ajuste a mano) → avisar
+                    celdas[r]['ajuste_manual'] = v
+                    reporte['manual'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                              'motivo': 'fórmula con ajuste manual'})
+                cont[tipo] += 1
+                continue
+            if isinstance(v, str):
+                celdas[r] = {'tipo': 'TEXTO', 'etiqueta': etiqueta, 'valor': v}
+                continue
+            if not es_numero(v):
+                continue
+            if abs(v) < 0.005:
+                celdas[r] = {'tipo': 'CONSTANTE', 'etiqueta': etiqueta, 'valor': 0}
+                cont['CONSTANTE'] += 1
+                continue
+            # ── número duro: cruzar con el balance ──
+            regla = None
+            cands = bal.buscar_valor(v, preferir_mov=es_eri)
+            if cands:
+                # preferir el código más específico (largo); entre iguales, el que aún no se usó
+                cands.sort(key=lambda c: (c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
+                regla = cands[0]
+                if regla['campo'] == 'mov' and not es_eri:
+                    reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                               'motivo': f"cruzó con el MOVIMIENTO del mes de {regla['codigo']}, no con el saldo. Confirmar."})
+            if regla is None:
+                tc = bal.buscar_tercero(v, etiqueta)
+                if tc:
+                    if len(tc) == 1 or tc[0]['score'] >= 0.5:
+                        regla = {k: tc[0][k] for k in ('tipo', 'codigos', 'nit', 'campo', 'signo')}
+                        regla['nombre'] = tc[0]['nombre']
+            if regla is None:
+                sc = bal.buscar_suma(v)
+                if sc:
+                    regla = sc[0]
+            if regla is not None:
+                celdas[r] = {'tipo': 'BALANCE', 'etiqueta': etiqueta, 'regla': regla, 'valor_base': v}
+                cont['BALANCE'] += 1
+                if regla['tipo'] == 'cuenta':
+                    codigos_usados.add(regla['codigo'])
+                elif regla['tipo'] == 'suma':
+                    codigos_usados.update(regla['codigos'])
+                else:
+                    codigos_usados.update(regla['codigos'])
+                continue
+            # constante (igual en meses anteriores)?
+            vals_ant = [ws.cell(r, c).value for c in anteriores]
+            if vals_ant and all(es_numero(x) and abs(x - v) <= TOL for x in vals_ant):
+                celdas[r] = {'tipo': 'CONSTANTE', 'etiqueta': etiqueta, 'valor': v}
+                cont['CONSTANTE'] += 1
+                reporte['constante'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v})
+                continue
+            celdas[r] = {'tipo': 'MANUAL', 'etiqueta': etiqueta, 'valor': v}
+            cont['MANUAL'] += 1
+            reporte['manual'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                      'motivo': 'no cruza con el balance'})
+
+        # ── segunda pasada: 'resto' dentro de bloques (subcuenta menos terceros con renglón propio) ──
+        for b in bloques:
+            filas = [r for r in range(b['inicio'], b['fin'] + 1) if r in celdas]
+            manuales = [r for r in filas if celdas[r]['tipo'] == 'MANUAL']
+            terc = [r for r in filas if celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero']
+            if not manuales or not terc:
+                continue
+            # prefijos de cuenta comunes a los terceros del bloque
+            prefijos = set()
+            for r in terc:
+                for cod in celdas[r]['regla']['codigos']:
+                    for ln in (4, 6, 8):
+                        if len(cod) >= ln:
+                            prefijos.add(cod[:ln])
+            for r in manuales:
+                v = celdas[r]['valor']
+                for pref in sorted(prefijos, key=len, reverse=True):
+                    base = bal.sf.get(pref)
+                    if base is None:
+                        continue
+                    nits = [celdas[x]['regla']['nit'] for x in terc if any(c.startswith(pref) for c in celdas[x]['regla']['codigos'])]
+                    resto = base
+                    for nit in nits:
+                        for cod, d in bal.terceros.items():
+                            if cod.startswith(pref) and nit in d:
+                                resto -= d[nit]['sf']
+                    if abs(abs(resto) - abs(v)) <= TOL:
+                        signo = 1 if (resto >= 0) == (v >= 0) else -1
+                        celdas[r] = {'tipo': 'BALANCE', 'etiqueta': celdas[r]['etiqueta'], 'valor_base': v,
+                                     'regla': {'tipo': 'resto', 'codigo': pref, 'excluir_nits': nits, 'campo': 'sf', 'signo': signo}}
+                        cont['MANUAL'] -= 1
+                        cont['BALANCE'] += 1
+                        reporte['manual'] = [m for m in reporte['manual'] if not (m['hoja'] == ws.title and m['fila'] == r)]
+                        codigos_usados.add(pref)
+                        break
+
+        # ── bloques con terceros: aprender la "nómina" (etiqueta → NIT) y la cuenta padre ──
+        bloques_out = []
+        for b in bloques:
+            filas = list(range(b['inicio'], b['fin'] + 1))
+            terc = [r for r in filas if r in celdas and celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero']
+            total_val = vals.get(ws.title, b['fila_total'], col)
+            cuenta_padre = None
+            if terc:
+                # prefijo común más largo entre los códigos de los terceros
+                cods = [c for r in terc for c in celdas[r]['regla']['codigos']]
+                pref = cods[0]
+                for c in cods[1:]:
+                    i = 0
+                    while i < min(len(pref), len(c)) and pref[i] == c[i]:
+                        i += 1
+                    pref = pref[:i]
+                if len(pref) >= 4:
+                    cuenta_padre = pref
+                # si el total del bloque cruza con una cuenta, esa es la padre (más confiable)
+                if es_numero(total_val):
+                    for cand in bal.buscar_valor(total_val):
+                        if cuenta_padre is None or cand['codigo'].startswith(cuenta_padre[:4]):
+                            cuenta_padre = cand['codigo']
+                            break
+            if not cuenta_padre:
+                continue
+            nomina = {}
+            terceros_balance = bal.terceros_bajo(cuenta_padre)
+            for r in filas:
+                et = etiqueta_valor(vals, ws, r, col)
+                if not et:
+                    continue
+                nit = None
+                if r in celdas and celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero':
+                    nit = celdas[r]['regla']['nit']
+                else:
+                    mejor = max(terceros_balance.items(), key=lambda kv: similitud(et, kv[1]['nombre']), default=None)
+                    if mejor and similitud(et, mejor[1]['nombre']) >= 0.6:
+                        nit = mejor[0]
+                nomina[str(r)] = {'etiqueta': et, 'nit': nit}
+            # ¿bloque "puro" de terceros? Si adentro hay un renglón a nivel de cuenta/suma/resto que ya
+            # cubre la cuenta padre (ej. "De clientes" = 280505 - Tis), los terceros nuevos YA están
+            # incluidos ahí y no hay que insertar filas.
+            puro = True
+            for r in filas:
+                c = celdas.get(r)
+                if c and c['tipo'] == 'BALANCE' and c['regla']['tipo'] in ('cuenta', 'suma', 'resto'):
+                    cods = [c['regla']['codigo']] if 'codigo' in c['regla'] else c['regla']['codigos']
+                    if any(cc[:4] == cuenta_padre[:4] for cc in cods):
+                        puro = False
+            bloques_out.append({'fila_total': b['fila_total'], 'inicio': b['inicio'], 'fin': b['fin'],
+                                'cuenta_padre': cuenta_padre, 'nomina': nomina, 'puro': puro,
+                                'signo': celdas[terc[0]]['regla']['signo'] if terc else 1})
+
+        molde['hojas'][ws.title] = {
+            'col_actual': col, 'fila_mes': p['fila_mes'], 'fila_anio': p['fila_anio'], 'col_anio': p['col_anio'],
+            'orden': p['orden'], 'anio': p['anio'], 'mes': p['mes'], 'formato_mes': p['formato_mes'],
+            'grupo_cols': p['grupo_cols'], 'es_eri': es_eri,
+            'celdas': {str(k): v for k, v in celdas.items()},
+            'bloques': bloques_out,
+        }
+        reporte['hojas'][ws.title] = dict(cont)
+
+    # ── cobertura: subcuentas del balance con saldo que ningún renglón usa ──
+    def cubierto(cod):
+        return any(u == cod or cod.startswith(u) or u.startswith(cod) for u in codigos_usados)
+    for cod, v in sorted(bal.sf.items()):
+        if len(cod) == 6 and abs(v) > TOL and cod[0] in '123' and not cubierto(cod):
+            reporte['sin_ubicar'].append({'codigo': cod, 'nombre': bal.nombre.get(cod, ''), 'saldo': round(v, 2)})
+
+    tot = defaultdict(int)
+    for h, c in reporte['hojas'].items():
+        for k, n in c.items():
+            tot[k] += n
+    reporte['resumen'] = dict(tot)
+    reporte['resumen']['hojas_con_meses'] = len(molde['hojas'])
+    reporte['resumen']['hojas_total'] = len(wb.sheetnames)
+    reporte['resumen']['periodo_base'] = molde['periodo_base']
+
+    json.dump(molde, open(molde_out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    try:
+        os.unlink(esf_opt)
+    except OSError:
+        pass
+    print(json.dumps({'ok': True, 'reporte': reporte, 'empresa': bal.meta['empresa'], 'nit': bal.meta['nit'],
+                      'periodo_base': molde['periodo_base']}, ensure_ascii=False))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FASE B — EXTENDER
+# ─────────────────────────────────────────────────────────────────────────
+def copiar_estilo(origen, destino):
+    if origen.has_style:
+        destino._style = copy.copy(origen._style)
+
+
+def insertar_columna_hoja(wb, ws, col, n=1):
+    """Inserta n columnas en `col` moviendo celdas, estilos, merges, anchos (NO fórmulas: eso va aparte)."""
+    ws.insert_cols(col, n)
+    # merges
+    nuevos = []
+    for m in list(ws.merged_cells.ranges):
+        ws.merged_cells.remove(m)
+        min_c, max_c = m.min_col, m.max_col
+        if min_c >= col:
+            min_c += n
+            max_c += n
+        elif max_c >= col:
+            max_c += n
+        nuevos.append((min_c, m.min_row, max_c, m.max_row))
+    for (a, b, c, d) in nuevos:
+        ws.merge_cells(start_row=b, start_column=a, end_row=d, end_column=c)
+    # anchos
+    dims = {}
+    for k, d in list(ws.column_dimensions.items()):
+        try:
+            ci = column_index_from_string(k)
+        except Exception:
+            continue
+        dims[ci] = (d.width, d.hidden)
+    for k in list(ws.column_dimensions.keys()):
+        del ws.column_dimensions[k]
+    for ci, (w, h) in dims.items():
+        nc = ci + n if ci >= col else ci
+        cd = ws.column_dimensions[get_column_letter(nc)]
+        if w:
+            cd.width = w
+        cd.hidden = h
+    # freeze panes
+    if ws.freeze_panes:
+        m = REF_RE.match(ws.freeze_panes)
+        if m:
+            c = column_index_from_string(m.group(2))
+            if c >= col:
+                ws.freeze_panes = f"{get_column_letter(c + n)}{m.group(4)}"
+
+
+def insertar_fila_hoja(ws, fila, n=1):
+    ws.insert_rows(fila, n)
+    nuevos = []
+    for m in list(ws.merged_cells.ranges):
+        ws.merged_cells.remove(m)
+        min_r, max_r = m.min_row, m.max_row
+        if min_r >= fila:
+            min_r += n
+            max_r += n
+        elif max_r >= fila:
+            max_r += n
+        nuevos.append((m.min_col, min_r, m.max_col, max_r))
+    for (a, b, c, d) in nuevos:
+        ws.merge_cells(start_row=b, start_column=a, end_row=d, end_column=c)
+    dims = {}
+    for k, d in list(ws.row_dimensions.items()):
+        dims[k] = (d.height, d.hidden)
+    for k in list(ws.row_dimensions.keys()):
+        del ws.row_dimensions[k]
+    for ri, (h, hid) in dims.items():
+        nr = ri + n if ri >= fila else ri
+        rd = ws.row_dimensions[nr]
+        if h:
+            rd.height = h
+        rd.hidden = hid
+    if ws.freeze_panes:
+        m = REF_RE.match(ws.freeze_panes)
+        if m and int(m.group(4)) >= fila:
+            ws.freeze_panes = f"{m.group(2)}{int(m.group(4)) + n}"
+
+
+def reescribir_todo(wb, ins_cols, ins_rows):
+    for ws in wb.worksheets:
+        max_fila = min(ws.max_row, MAX_FILAS)
+        for row in ws.iter_rows(min_row=1, max_row=max_fila):
+            for cell in row:
+                v = cell.value
+                if es_formula(v):
+                    nv = reescribir_formula(v, ws.title, ins_cols, ins_rows)
+                    if nv != v:
+                        cell.value = nv
+
+
+def proper(nombre):
+    out = []
+    for w in str(nombre).strip().split():
+        lw = w.lower().strip('.,')
+        if '.' in w or lw in ('sas', 'sa', 'ltda', 'eu', 'sca', 'bic', 'esp', 'eps', 'arl'):
+            out.append(w.upper())
+        else:
+            out.append(w.capitalize())
+    return ' '.join(out)
+
+
+def extender(esf_path, molde_path, balance_path, salida_path):
+    molde = json.load(open(molde_path, encoding='utf-8'))
+    bal = Balance(json.load(open(balance_path, encoding='utf-8')))
+    esf_opt = cargar_optimizado(esf_path)
+    wb = openpyxl.load_workbook(esf_opt)
+    nuevo_anio, nuevo_mes = bal.meta['anio'], bal.meta['mes']
+    base = molde['periodo_base']
+    reporte = {'periodo_nuevo': {'anio': nuevo_anio, 'mes': nuevo_mes}, 'periodo_anterior': base,
+               'hojas': {}, 'revisar': [], 'terceros_nuevos': [], 'sin_ubicar': [], 'advertencias': []}
+
+    if (nuevo_anio * 100 + nuevo_mes) <= (base['anio'] * 100 + base['mes']):
+        reporte['advertencias'].append(
+            f"El balance es de {nuevo_mes}/{nuevo_anio} y el ESF ya va en {base['mes']}/{base['anio']}. Se agrega igual, revisa el orden.")
+    if molde.get('nit') and bal.meta['nit'] and norm(molde['nit']).replace('-', '').replace('.', '') != norm(bal.meta['nit']).replace('-', '').replace('.', ''):
+        reporte['advertencias'].append(f"NIT distinto: molde {molde['nit']} vs balance {bal.meta['nit']}.")
+
+    # 1) Re-detectar columnas actuales en el archivo (por si cambió) y planear inserciones
+    plan = {}
+    for nombre, h in molde['hojas'].items():
+        if nombre not in wb.sheetnames:
+            reporte['advertencias'].append(f"La hoja '{nombre}' del molde no está en el archivo.")
+            continue
+        ws = wb[nombre]
+        p = detectar_periodos(ws)
+        if not p:
+            continue
+        col = p['col_actual']
+        cambia_anio = (nuevo_anio != p['anio'])
+        if p['orden'] == 'reciente_izquierda':
+            col_nueva = col
+            n = 2 if cambia_anio else 1       # columna separadora + mes nuevo
+        else:
+            col_nueva = col + 1
+            n = 2 if cambia_anio else 1
+        plan[nombre] = {'p': p, 'col_vieja': col, 'col_nueva': col_nueva if p['orden'] == 'reciente_izquierda' else col_nueva + (1 if cambia_anio else 0),
+                        'n': n, 'cambia_anio': cambia_anio, 'ins_en': col_nueva}
+
+    # 2) Insertar columnas y reescribir TODAS las fórmulas del libro
+    ins_cols = {nombre: [pl['ins_en']] * pl['n'] for nombre, pl in plan.items()}
+    for nombre, pl in plan.items():
+        insertar_columna_hoja(wb, wb[nombre], pl['ins_en'], pl['n'])
+    reescribir_todo(wb, ins_cols, {})
+
+    # posición de las columnas después de insertar
+    for nombre, pl in plan.items():
+        p = pl['p']
+        if p['orden'] == 'reciente_izquierda':
+            pl['col_mes'] = pl['ins_en']                       # mes nuevo
+            pl['col_sep'] = pl['ins_en'] + 1 if pl['cambia_anio'] else None
+            pl['col_ant'] = pl['col_vieja'] + pl['n']           # mes anterior (se corrió)
+        else:
+            pl['col_sep'] = pl['ins_en'] if pl['cambia_anio'] else None
+            pl['col_mes'] = pl['ins_en'] + (1 if pl['cambia_anio'] else 0)
+            pl['col_ant'] = pl['col_vieja']
+    col_min_por_hoja = {nombre: min(pl['col_mes'], pl['col_ant']) for nombre, pl in plan.items()}
+
+    # 3) Por hoja: estilos, encabezados, fórmulas clonadas, valores
+    ins_rows_total = defaultdict(list)
+    for nombre, pl in plan.items():
+        ws = wb[nombre]
+        h = molde['hojas'][nombre]
+        p = pl['p']
+        cm, ca = pl['col_mes'], pl['col_ant']
+        max_fila = min(ws.max_row, MAX_FILAS)
+        cont = defaultdict(int)
+
+        # estilos + ancho
+        for r in range(1, max_fila + 1):
+            copiar_estilo(ws.cell(r, ca), ws.cell(r, cm))
+        if ws.column_dimensions[get_column_letter(ca)].width:
+            ws.column_dimensions[get_column_letter(cm)].width = ws.column_dimensions[get_column_letter(ca)].width
+        if pl['col_sep']:
+            # separador: copiar estilo/ancho de un separador existente (columna antes del grupo anterior)
+            sep_ref = None
+            grupo_ant = [c + (pl['n'] if c >= pl['ins_en'] else 0) for c in p['grupo_cols']]
+            cand = max(grupo_ant) + 1 if p['orden'] == 'reciente_izquierda' else min(grupo_ant) - 1
+            if 1 <= cand <= ws.max_column:
+                sep_ref = cand
+            if sep_ref:
+                for r in range(1, max_fila + 1):
+                    copiar_estilo(ws.cell(r, sep_ref), ws.cell(r, pl['col_sep']))
+                w = ws.column_dimensions[get_column_letter(sep_ref)].width
+                if w:
+                    ws.column_dimensions[get_column_letter(pl['col_sep'])].width = w
+
+        # encabezados
+        fm = p['fila_mes']
+        mes_txt = ABREV[nuevo_mes]
+        ref_mes = str(ws.cell(fm, ca).value or '')
+        if ref_mes and ref_mes == ref_mes.lower():
+            mes_txt = mes_txt.lower()
+        elif ref_mes and ref_mes == ref_mes.capitalize():
+            mes_txt = mes_txt.capitalize()
+        ws.cell(fm, cm).value = mes_txt
+        # textos de encabezado que mencionan el mes anterior ("ACUMULADO A ABR") → mes nuevo
+        viejo = ABREV[p['mes']]
+        pat_mes = re.compile(r'\b' + viejo + r'\b', re.I)
+        for rr in range(max(1, fm - 3), fm + 2):
+            for cc in range(1, min(ws.max_column, 80) + 1):
+                vv = ws.cell(rr, cc).value
+                if isinstance(vv, str) and not es_formula(vv) and cc != cm and pat_mes.search(vv) and norm(vv) != viejo.lower():
+                    ws.cell(rr, cc).value = pat_mes.sub(mes_txt.upper() if vv.isupper() else mes_txt, vv)
+        if p['fila_anio']:
+            fa = p['fila_anio']
+            # la celda de año del grupo actual se corrió junto con las columnas
+            col_anio_ahora = p['col_anio'] + (pl['n'] if p['col_anio'] >= pl['ins_en'] else 0)
+            if pl['cambia_anio']:
+                ws.cell(fa, cm).value = nuevo_anio
+                copiar_estilo(ws.cell(fa, col_anio_ahora), ws.cell(fa, cm))
+            elif p['orden'] == 'reciente_izquierda' and col_anio_ahora == ca:
+                # el año estaba en la columna del mes actual: moverlo a la nueva y, si estaba
+                # combinado (B4:E4), extender la combinación para que arranque en la columna nueva
+                ws.cell(fa, cm).value = ws.cell(fa, col_anio_ahora).value
+                ws.cell(fa, col_anio_ahora).value = None
+                for m in list(ws.merged_cells.ranges):
+                    if m.min_row == fa and m.min_col == col_anio_ahora:
+                        ws.merged_cells.remove(m)
+                        ws.merge_cells(start_row=m.min_row, start_column=cm, end_row=m.max_row, end_column=m.max_col)
+                        break
+
+        # celdas
+        bloques = h.get('bloques', [])
+        for fila_s, c in h['celdas'].items():
+            r = int(fila_s)
+            tipo = c['tipo']
+            dst = ws.cell(r, cm)
+            if tipo in ('FORMULA', 'CADENA'):
+                f_ant = ws.cell(r, ca).value
+                if es_formula(f_ant):
+                    dst.value = trasladar_formula(f_ant, nombre, ca, cm, col_min_por_hoja)
+                    if c.get('ajuste_manual'):
+                        reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'],
+                                                   'tipo': 'ajuste_manual', 'detalle': f"La fórmula del mes anterior tenía un ajuste a mano: {c['ajuste_manual']}"})
+                cont[tipo] += 1
+            elif tipo == 'BALANCE':
+                val, ok = bal.valor(c['regla'])
+                val = round(val, 2) if ok else 0
+                if c.get('ajuste'):
+                    # fórmula con ajuste a mano: número nuevo del balance + el ajuste de ella, y se avisa.
+                    # Se parte de la fórmula viva del mes anterior (ya con referencias corridas), se cambia
+                    # solo el token numérico y se traslada a la columna nueva.
+                    f_ant = ws.cell(r, ca).value
+                    texto = repr(abs(val)) if isinstance(val, float) and not float(val).is_integer() else str(int(abs(val)))
+                    if es_formula(f_ant):
+                        try:
+                            toks = Tokenizer(f_ant).items
+                            idx = c.get('ajuste_idx')
+                            if idx is not None and idx < len(toks) and toks[idx].subtype == Token.NUMBER:
+                                partes = ['=']
+                                for i, t in enumerate(toks):
+                                    partes.append(texto if i == idx else t.value)
+                                f_nueva = ''.join(partes)
+                            else:
+                                f_nueva = c['ajuste'].replace('{V}', texto)
+                        except Exception:
+                            f_nueva = c['ajuste'].replace('{V}', texto)
+                        dst.value = trasladar_formula(f_nueva, nombre, ca, cm, col_min_por_hoja)
+                    else:
+                        dst.value = c['ajuste'].replace('{V}', texto)
+                    reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'],
+                                               'tipo': 'ajuste_manual', 'detalle': f"Se actualizó el valor del balance pero se conservó el ajuste a mano del mes anterior: {dst.value}"})
+                else:
+                    dst.value = val
+                if not ok:
+                    reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'],
+                                               'tipo': 'cuenta_ausente', 'detalle': f"La regla {c['regla']} no encontró la cuenta en el balance nuevo. Se dejó en 0."})
+                cont['BALANCE'] += 1
+            elif tipo == 'CONSTANTE':
+                dst.value = c['valor']
+                cont['CONSTANTE'] += 1
+            elif tipo == 'MANUAL':
+                dst.value = c['valor']
+                reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'],
+                                           'tipo': 'manual', 'detalle': f"Valor del mes anterior arrastrado ({c['valor']:,.0f}). No viene del balance: revísalo."})
+                cont['MANUAL'] += 1
+            elif tipo == 'TEXTO':
+                dst.value = c['valor']
+
+        # 4) terceros nuevos por bloque → insertar filas dentro del bloque (en orden alfabético)
+        nits_hoja = set()
+        for bb in bloques:
+            nits_hoja.update(v['nit'] for v in bb['nomina'].values() if v.get('nit'))
+        for c in h['celdas'].values():
+            if c['tipo'] == 'BALANCE' and c['regla']['tipo'] == 'tercero':
+                nits_hoja.add(c['regla']['nit'])
+            if c['tipo'] == 'BALANCE' and c['regla']['tipo'] == 'resto':
+                nits_hoja.update(c['regla'].get('excluir_nits', []))
+        for b in sorted(bloques, key=lambda b: -b['inicio']):
+            if not b.get('puro', True):
+                continue
+            nits_conocidos = nits_hoja
+            nuevos = []
+            for nit, t in bal.terceros_bajo(b['cuenta_padre']).items():
+                if nit in nits_conocidos or abs(t['sf']) <= TOL:
+                    continue
+                nuevos.append((nit, t))
+            if not nuevos:
+                continue
+            nuevos.sort(key=lambda x: norm(proper(x[1]['nombre'])))
+            # posición alfabética dentro del bloque; nunca en la primera fila (para que el SUM se expanda)
+            # ni después de la última (quedaría fuera del rango)
+            primero = norm(proper(nuevos[0][1]['nombre']))
+            pos = b['fin'] + 1
+            for rr in range(b['inicio'], b['fin'] + 1):
+                et = norm(b['nomina'].get(str(rr), {}).get('etiqueta') or etiqueta_valor_ws(ws, rr, cm))
+                if et and et > primero:
+                    pos = rr
+                    break
+            fila_ins = min(max(pos, b['inicio'] + 1), b['fin'])
+            n = len(nuevos)
+            insertar_fila_hoja(ws, fila_ins, n)
+            reescribir_todo(wb, {}, {nombre: [(fila_ins, n)]})
+            if b['fin'] == b['inicio']:
+                # bloque de una sola fila: el SUM(Xa:Xa) no se expande solo → arreglarlo
+                fila_total = b['fila_total'] + (n if b['fila_total'] >= fila_ins else 0)
+                ft = ws.cell(fila_total, cm).value
+                letra = get_column_letter(cm)
+                if es_formula(ft):
+                    ws.cell(fila_total, cm).value = re.sub(
+                        r'SUM\(' + letra + r'(\d+):' + letra + r'(\d+)\)',
+                        lambda m: f"SUM({letra}{m.group(1)}:{letra}{int(m.group(2)) + n})", ft, flags=re.I)
+            ref_row = fila_ins - 1
+            col_et = 1
+            for cc in range(1, cm):
+                if isinstance(ws.cell(ref_row, cc).value, str):
+                    col_et = cc
+                    break
+            for i, (nit, t) in enumerate(nuevos):
+                rr = fila_ins + i
+                for cc in range(1, min(ws.max_column, 60) + 1):
+                    copiar_estilo(ws.cell(ref_row, cc), ws.cell(rr, cc))
+                ws.cell(rr, col_et).value = proper(t['nombre'])
+                ws.cell(rr, cm).value = round(b.get('signo', 1) * t['sf'], 2)
+                reporte['terceros_nuevos'].append({'hoja': nombre, 'celda': ws.cell(rr, cm).coordinate, 'nit': nit,
+                                                   'nombre': proper(t['nombre']), 'valor': round(t['sf'], 2),
+                                                   'cuenta': b['cuenta_padre']})
+            # correr en el molde todo lo que quedó debajo de la inserción (en esta hoja)
+            def corre(x):
+                return x + n if x >= fila_ins else x
+            for bb in bloques:
+                bb['inicio'] = corre(bb['inicio'])
+                bb['fin'] = corre(bb['fin'])
+                bb['fila_total'] = corre(bb['fila_total'])
+                bb['nomina'] = {str(corre(int(k))): v for k, v in bb['nomina'].items()}
+            h['celdas'] = {str(corre(int(k))): v for k, v in h['celdas'].items()}
+            for i, (nit, t) in enumerate(nuevos):
+                b['nomina'][str(fila_ins + i)] = {'etiqueta': proper(t['nombre']), 'nit': nit}
+                h['celdas'][str(fila_ins + i)] = {'tipo': 'BALANCE', 'etiqueta': proper(t['nombre']),
+                                                  'regla': {'tipo': 'tercero', 'codigos': t['codigos'], 'nit': nit,
+                                                            'campo': 'sf', 'signo': b.get('signo', 1), 'nombre': t['nombre']}}
+
+        reporte['hojas'][nombre] = dict(cont)
+        # actualizar molde: nueva columna actual
+        h['col_actual'] = cm
+        h['anio'], h['mes'] = nuevo_anio, nuevo_mes
+        h['fila_anio'] = p['fila_anio']
+        h['col_anio'] = cm if (pl['cambia_anio'] or (p['orden'] == 'reciente_izquierda')) else (p['col_anio'] or cm)
+        h['grupo_cols'] = ([cm] if pl['cambia_anio'] else [cm] + [c + pl['n'] for c in p['grupo_cols']])
+
+    # 5) cobertura del balance nuevo
+    codigos_usados = set()
+    for h in molde['hojas'].values():
+        for c in h['celdas'].values():
+            if c['tipo'] == 'BALANCE':
+                rg = c['regla']
+                if rg['tipo'] in ('cuenta', 'resto'):
+                    codigos_usados.add(rg['codigo'])
+                else:
+                    codigos_usados.update(rg['codigos'])
+        for b in h.get('bloques', []):
+            codigos_usados.add(b['cuenta_padre'])
+
+    def cubierto(cod):
+        return any(u == cod or cod.startswith(u) or u.startswith(cod) for u in codigos_usados)
+    for cod, v in sorted(bal.sf.items()):
+        if len(cod) == 6 and abs(v) > TOL and cod[0] in '123' and not cubierto(cod):
+            reporte['sin_ubicar'].append({'codigo': cod, 'nombre': bal.nombre.get(cod, ''), 'saldo': round(v, 2)})
+
+    molde['periodo_base'] = {'anio': nuevo_anio, 'mes': nuevo_mes}
+    wb.save(salida_path)
+    try:
+        os.unlink(esf_opt)
+    except OSError:
+        pass
+    json.dump(molde, open(molde_path, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    reporte['resumen'] = {
+        'celdas_balance': sum(c.get('BALANCE', 0) for c in reporte['hojas'].values()),
+        'celdas_formula': sum(c.get('FORMULA', 0) + c.get('CADENA', 0) for c in reporte['hojas'].values()),
+        'revisar': len(reporte['revisar']), 'terceros_nuevos': len(reporte['terceros_nuevos']),
+        'sin_ubicar': len(reporte['sin_ubicar']), 'hojas': len(reporte['hojas']),
+    }
+    print(json.dumps({'ok': True, 'reporte': reporte}, ensure_ascii=False))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    try:
+        if len(args) == 4 and args[0] == 'aprender':
+            aprender(args[1], args[2], args[3])
+        elif len(args) == 5 and args[0] == 'extender':
+            extender(args[1], args[2], args[3], args[4])
+        else:
+            print(__doc__)
+            sys.exit(2)
+    except SystemExit:
+        raise
+    except Exception as e:
+        import traceback
+        sys.stderr.write(traceback.format_exc())
+        print(json.dumps({'ok': False, 'error': str(e)}, ensure_ascii=False))
+        sys.exit(1)

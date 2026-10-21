@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   FileSpreadsheet,
+  Layers,
   Receipt,
   Calculator,
   Settings,
@@ -37,6 +38,12 @@ const NAV_ITEMS: NavItem[] = [
     href: '/motor-contable',
     label: 'Motor Contable',
     icon: FileSpreadsheet,
+    roles: ['administrador', 'contador'],
+  },
+  {
+    href: '/esf-molde',
+    label: 'ESF por molde',
+    icon: Layers,
     roles: ['administrador', 'contador'],
   },
   {
