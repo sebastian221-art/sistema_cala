@@ -7,6 +7,8 @@
 -- Limpiar datos 2026 anteriores antes de insertar
 DELETE FROM tax_calendar WHERE año = 2026;
 
+
+
 -- ─── RETENCIÓN EN LA FUENTE MENSUAL 2026 ────────────────────────────────────
 -- Por último dígito del NIT. Período Enero 2026 → vence Febrero 2026
 
