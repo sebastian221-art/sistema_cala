@@ -30,7 +30,7 @@ El balance.json lo produce balanceAJson.ts (usa el parser existente).
 Dependencias: openpyxl.
 """
 import sys, json, re, copy, unicodedata, zipfile, shutil, os, tempfile
-from collections import defaultdict
+from collections import defaultdict, Counter
 from itertools import combinations
 
 import openpyxl
@@ -206,16 +206,33 @@ class Balance:
         return res
 
     def terceros_bajo(self, codigo):
-        """Todos los terceros cuyo código auxiliar empieza por `codigo`: {nit: {'nombre','sf','mov','codigos':[...]}}."""
+        """Todos los terceros cuyo código auxiliar empieza por `codigo` (str o lista de prefijos):
+        {nit: {'nombre','sf','mov','codigos':[...]}}."""
+        prefijos = [codigo] if isinstance(codigo, str) else list(codigo)
         out = {}
         for cod, d in self.terceros.items():
-            if cod.startswith(codigo):
+            if any(cod.startswith(pf) for pf in prefijos):
                 for nit, t in d.items():
                     o = out.setdefault(nit, {'nombre': t['nombre'], 'sf': 0.0, 'mov': 0.0, 'codigos': []})
                     o['sf'] += t['sf']
                     o['mov'] += t['mov']
                     o['codigos'].append(cod)
         return out
+
+
+def es_nit(v):
+    if es_numero(v):
+        return float(v).is_integer() and 10_000 <= abs(v) < 10**15
+    if isinstance(v, str):
+        t = re.sub(r'[\s.\-]', '', v)
+        return t.isdigit() and 5 <= len(t) <= 15
+    return False
+
+
+def nit_texto(v):
+    if es_numero(v):
+        return str(int(v))
+    return re.sub(r'[\s.\-]', '', str(v))
 
 
 def similitud(a, b):
@@ -388,9 +405,25 @@ NOMBRE_MES = {1: 'ENERO', 2: 'FEBRERO', 3: 'MARZO', 4: 'ABRIL', 5: 'MAYO', 6: 'J
               8: 'AGOSTO', 9: 'SEPTIEMBRE', 10: 'OCTUBRE', 11: 'NOVIEMBRE', 12: 'DICIEMBRE'}
 
 
-def texto_mes(mes, ejemplo):
-    """Escribe el mes nuevo con el mismo estilo del encabezado de ejemplo ('ABR', 'AGOSTO', 'Agosto')."""
+MES_ANIO_RE = re.compile(r'^([a-z]+)[\s\-/.]*(\d{2}|\d{4})$')
+
+
+def texto_mes(mes, ejemplo, anio=None):
+    """Escribe el mes nuevo con el mismo estilo del encabezado de ejemplo ('ABR', 'AGOSTO', 'Agosto', 'AGO-26')."""
     ej = str(ejemplo or '').strip()
+    mm = MES_ANIO_RE.match(norm(ej))
+    if mm and anio is not None:
+        sep = re.sub(r'[a-zA-Z0-9]', '', ej).strip() or ''
+        sep = sep if sep else ''
+        m_sep = re.search(r'[A-Za-z]+([\s\-/.]*)\d', ej)
+        sep = m_sep.group(1) if m_sep else ''
+        yy = str(anio) if len(mm.group(2)) == 4 else str(anio)[-2:]
+        base = ABREV[mes] if len(mm.group(1)) <= 4 else NOMBRE_MES[mes]
+        if ej[:1].islower():
+            base = base.lower()
+        elif ej[:1].isupper() and ej[1:2].islower():
+            base = base.capitalize()
+        return f"{base}{sep}{yy}"
     completo = norm(ej) in NOMBRE_MES.get(MESES.get(norm(ej), 0), '').lower() and len(norm(ej)) > 4
     txt = NOMBRE_MES[mes] if completo else ABREV[mes]
     if ej and ej == ej.lower():
@@ -412,6 +445,7 @@ def detectar_periodos(ws, getval=None):
     """
     anios = []   # (fila, col, anio)
     meses = []   # (fila, col, mes)
+    anio_emb = {}  # (fila, col) → año embebido en el encabezado ("AGO-26")
     max_r = min(ws.max_row, MAX_HEADER)
     max_c = min(ws.max_column, 80)
     for r in range(1, max_r + 1):
@@ -427,6 +461,12 @@ def detectar_periodos(ws, getval=None):
                     anios.append((r, c, int(t)))
                 elif t in MESES:
                     meses.append((r, c, MESES[t]))
+                else:
+                    mm = MES_ANIO_RE.match(t)
+                    if mm and mm.group(1) in MESES:
+                        yy = int(mm.group(2))
+                        meses.append((r, c, MESES[mm.group(1)]))
+                        anio_emb[(r, c)] = yy if yy > 1900 else 2000 + yy
     if not meses:
         return None
     por_fila = defaultdict(list)
@@ -438,6 +478,9 @@ def detectar_periodos(ws, getval=None):
     periodos = []
     anios_arriba = [(r, c, a) for r, c, a in anios if r < fila_mes]
     for c, m in cols:
+        if (fila_mes, c) in anio_emb:
+            periodos.append([c, anio_emb[(fila_mes, c)], m])
+            continue
         cand = [(cc, a, r) for r, cc, a in anios_arriba if cc <= c]
         if cand:
             cand.sort(key=lambda x: (-x[0], -x[2]))
@@ -767,7 +810,7 @@ def detectar_bloques(ws, col_actual, max_fila):
     """Bloques = rangos verticales sumados por una fórmula SUM(Xa:Xb) en la columna actual."""
     bloques = []
     letra = get_column_letter(col_actual)
-    pat = re.compile(r'SUM\(\$?' + letra + r'\$?(\d+):\$?' + letra + r'\$?(\d+)\)', re.I)
+    pat = re.compile(r'(?:SUM|SUBTOTAL\(\s*9\s*,)\s*\(?\$?' + letra + r'\$?(\d+):\$?' + letra + r'\$?(\d+)\)', re.I)
     for r in range(1, max_fila + 1):
         v = ws.cell(r, col_actual).value
         if es_formula(v):
@@ -787,8 +830,9 @@ def cargar_optimizado(esf_path):
     return tmp.name
 
 
-def aprender(esf_path, balance_path, molde_out):
+def aprender(esf_path, balance_path, molde_out, reglas_path=None):
     bal = Balance(json.load(open(balance_path, encoding='utf-8')))
+    reglas = json.load(open(reglas_path, encoding='utf-8')) if reglas_path else {}
     esf_opt = cargar_optimizado(esf_path)
     wb = openpyxl.load_workbook(esf_opt)                       # fórmulas
     molde = {'version': 1, 'empresa': bal.meta['empresa'] or '', 'nit': bal.meta['nit'] or '',
@@ -965,62 +1009,219 @@ def aprender(esf_path, balance_path, molde_out):
                         codigos_usados.add(pref)
                         break
 
-        # ── bloques con terceros: aprender la "nómina" (etiqueta → NIT) y la cuenta padre ──
+        # ── bloques con terceros: aprender la "nómina" (fila → NIT) y la cuenta padre ──
         bloques_out = []
         for b in bloques:
             filas = list(range(b['inicio'], b['fin'] + 1))
             terc = [r for r in filas if r in celdas and celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero']
             total_val = vals.get(ws.title, b['fila_total'], col)
+
+            # ¿Hay una columna con el NIT de cada tercero (anexos de cartera)? → emparejar por NIT, no por nombre
+            nit_col = None
+            for cc in range(1, col):
+                n_nit = sum(1 for r in filas if es_nit(ws.cell(r, cc).value))
+                if n_nit >= 3 and n_nit >= 0.5 * len(filas):
+                    nit_col = cc
+                    break
+            nits_col = {r: nit_texto(ws.cell(r, nit_col).value) for r in filas if nit_col and es_nit(ws.cell(r, nit_col).value)}
+
             cuenta_padre = None
-            if terc:
-                # prefijo común más largo entre los códigos de los terceros
-                cods = [c for r in terc for c in celdas[r]['regla']['codigos']]
-                pref = cods[0]
-                for c in cods[1:]:
-                    i = 0
-                    while i < min(len(pref), len(c)) and pref[i] == c[i]:
-                        i += 1
-                    pref = pref[:i]
-                if len(pref) >= 4:
-                    cuenta_padre = pref
-                # si el total del bloque cruza con una cuenta, esa es la padre (más confiable)
-                if es_numero(total_val):
-                    for cand in bal.buscar_valor(total_val):
-                        if cuenta_padre is None or cand['codigo'].startswith(cuenta_padre[:4]):
-                            cuenta_padre = cand['codigo']
-                            break
+            if nits_col:
+                # la cuenta padre es el prefijo (8 o 6 dígitos) bajo el que los VALORES de la hoja cruzan
+                # con el saldo del tercero (un NIT puede aparecer en muchas cuentas: ventas, cartera...).
+                # Si ninguna fila tiene valor, se usa cobertura de NITs, limitada a cuentas de balance (o de
+                # resultado si la hoja es del ERI).
+                clases_ok = ('4', '5', '6', '7') if es_eri else ('1', '2', '3')
+                mejor, mejor_n = None, 0
+                for ln in (8, 6):
+                    score = defaultdict(int)
+                    for r, nit in nits_col.items():
+                        v = ws.cell(r, col).value
+                        if not es_numero(v) or abs(v) <= TOL:
+                            continue
+                        for cod in bal.codigos_tercero_por_nit.get(nit, ()):
+                            t = bal.terceros[cod].get(nit)
+                            if t and abs(abs(t['sf']) - abs(v)) <= TOL:
+                                score[cod[:ln]] += 1
+                    if score:
+                        pf, n = max(score.items(), key=lambda kv: kv[1])
+                        if n > mejor_n:
+                            mejor, mejor_n = pf, n
+                if not mejor:
+                    for ln in (8, 6):
+                        cobertura = defaultdict(int)
+                        for nit in nits_col.values():
+                            for cod in bal.codigos_tercero_por_nit.get(nit, ()):
+                                if cod[0] in clases_ok:
+                                    cobertura[cod[:ln]] += 1
+                        if cobertura:
+                            pf, n = max(cobertura.items(), key=lambda kv: kv[1])
+                            if n > mejor_n:
+                                mejor, mejor_n = pf, n
+                if mejor and mejor_n >= 3:
+                    cuenta_padre = mejor
+            if cuenta_padre is None and terc:
+                # umbral: un solo cruce por valor con un tercero suele ser coincidencia (ej. "Sueldos")
+                n_num = sum(1 for r in filas if r in celdas and celdas[r]['tipo'] in ('BALANCE', 'MANUAL', 'CONSTANTE'))
+                if len(terc) >= 2 and (len(terc) >= 5 or len(terc) >= 0.2 * max(1, n_num)):
+                    cods = [c for r in terc for c in celdas[r]['regla']['codigos']]
+                    pref = cods[0]
+                    for c in cods[1:]:
+                        i = 0
+                        while i < min(len(pref), len(c)) and pref[i] == c[i]:
+                            i += 1
+                        pref = pref[:i]
+                    if len(pref) >= 4:
+                        cuenta_padre = pref
+                    if es_numero(total_val):
+                        for cand in bal.buscar_valor(total_val):
+                            if cuenta_padre is None or cand['codigo'].startswith(cuenta_padre[:4]):
+                                cuenta_padre = cand['codigo']
+                                break
             if not cuenta_padre:
+                # no es un bloque de terceros. Un ÚNICO cruce "por valor" con un tercero es coincidencia
+                # (ej. "Sueldos" = saldo de un empleado); varios cruces se respetan aunque no compartan cuenta.
+                for r in (terc if len(terc) < 2 else []):
+                    v = celdas[r].get('valor_base')
+                    celdas[r] = {'tipo': 'MANUAL', 'etiqueta': celdas[r]['etiqueta'], 'valor': v}
+                    cont['BALANCE'] -= 1
+                    cont['MANUAL'] += 1
+                    reporte['manual'].append({'hoja': ws.title, 'fila': r, 'etiqueta': celdas[r]['etiqueta'], 'valor': v,
+                                              'motivo': 'coincidencia aislada con un tercero; se trata como manual'})
                 continue
+
             nomina = {}
             terceros_balance = bal.terceros_bajo(cuenta_padre)
+            signo_bloque = celdas[terc[0]]['regla']['signo'] if terc else None
             for r in filas:
                 et = etiqueta_valor(vals, ws, r, col)
-                if not et:
+                nit = nits_col.get(r)
+                if not et and not nit:
                     continue
-                nit = None
-                if r in celdas and celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero':
-                    nit = celdas[r]['regla']['nit']
-                else:
-                    mejor = max(terceros_balance.items(), key=lambda kv: similitud(et, kv[1]['nombre']), default=None)
-                    if mejor and similitud(et, mejor[1]['nombre']) >= 0.6:
-                        nit = mejor[0]
+                if nit is None:
+                    if r in celdas and celdas[r]['tipo'] == 'BALANCE' and celdas[r]['regla']['tipo'] == 'tercero':
+                        nit = celdas[r]['regla']['nit']
+                    else:
+                        mejor = max(terceros_balance.items(), key=lambda kv: similitud(et, kv[1]['nombre']), default=None)
+                        if mejor and similitud(et, mejor[1]['nombre']) >= 0.6:
+                            nit = mejor[0]
                 nomina[str(r)] = {'etiqueta': et, 'nit': nit}
-            # ¿bloque "puro" de terceros? Si adentro hay un renglón a nivel de cuenta/suma/resto que ya
-            # cubre la cuenta padre (ej. "De clientes" = 280505 - Tis), los terceros nuevos YA están
-            # incluidos ahí y no hay que insertar filas.
+                # con columna NIT, el renglón se alimenta por NIT aunque el valor no cruce
+                if nits_col and nit:
+                    tb = terceros_balance.get(nit)
+                    cod_nit = tb['codigos'] if tb else [cuenta_padre] if isinstance(cuenta_padre, str) else list(cuenta_padre)
+                    v = ws.cell(r, col).value
+                    if es_numero(v) and tb and abs(tb['sf']) > 0.004 and signo_bloque is None:
+                        signo_bloque = 1 if (tb['sf'] >= 0) == (v >= 0) else -1
+                    prev = celdas.get(r)
+                    if prev and prev['tipo'] in ('BALANCE', 'MANUAL', 'CONSTANTE'):
+                        if prev['tipo'] != 'BALANCE':
+                            cont[prev['tipo']] -= 1
+                            cont['BALANCE'] += 1
+                            reporte['manual'] = [m for m in reporte['manual'] if not (m['hoja'] == ws.title and m['fila'] == r)]
+                        celdas[r] = {'tipo': 'BALANCE', 'etiqueta': et, 'valor_base': prev.get('valor_base', prev.get('valor')),
+                                     'regla': {'tipo': 'tercero', 'codigos': cod_nit, 'nit': nit, 'campo': 'sf',
+                                               'signo': signo_bloque or 1, 'nombre': tb['nombre'] if tb else et}}
+            # reglas de tercero dentro del bloque que cruzaron con OTRA cuenta (coincidencia de valor):
+            # si el NIT existe bajo la cuenta padre, se re-vincula; si no, se marca dudoso
+            prefijos_b = cuenta_padre if isinstance(cuenta_padre, list) else [cuenta_padre]
+            # subcuenta (6 díg.) que usa la mayoría del bloque: al re-vincular un NIT se usa solo esa,
+            # para no arrastrar otra subcuenta que la contadora lista aparte (220505 vs 220506)
+            sub_comun = Counter(cc[:6] for r in terc for cc in celdas[r]['regla']['codigos']
+                                if any(cc.startswith(pf) for pf in prefijos_b))
+            sub_comun = sub_comun.most_common(1)[0][0] if sub_comun else None
+            for r in terc:
+                rg = celdas[r]['regla']
+                if any(any(cc.startswith(pf) for pf in prefijos_b) for cc in rg['codigos']):
+                    continue
+                tb = terceros_balance.get(rg['nit'])
+                if tb:
+                    cods_ok = [cc for cc in tb['codigos'] if sub_comun and cc.startswith(sub_comun)] or tb['codigos']
+                    rg['codigos'] = cods_ok
+                    reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': celdas[r]['etiqueta'], 'valor': celdas[r].get('valor_base'),
+                                               'motivo': f"cruzó con otra cuenta por coincidencia; se vinculó a {','.join(prefijos_b)} por NIT"})
+                else:
+                    reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': celdas[r]['etiqueta'], 'valor': celdas[r].get('valor_base'),
+                                               'motivo': f"cruzó con {rg['codigos']} pero el bloque es de {','.join(prefijos_b)}. Confirmar."})
             puro = True
             cods_terc = [cc for r in terc for cc in celdas[r]['regla']['codigos']]
             for r in filas:
                 c = celdas.get(r)
                 if c and c['tipo'] == 'BALANCE' and c['regla']['tipo'] in ('cuenta', 'suma', 'resto'):
                     cods = [c['regla']['codigo']] if 'codigo' in c['regla'] else c['regla']['codigos']
-                    # solo descalifica si ese renglón CUBRE a los terceros (es prefijo de sus códigos);
-                    # una subcuenta hermana (220506 junto a terceros de 220505) no cuenta
                     if any(t.startswith(cc) for cc in cods for t in cods_terc):
                         puro = False
             bloques_out.append({'fila_total': b['fila_total'], 'inicio': b['inicio'], 'fin': b['fin'],
                                 'cuenta_padre': cuenta_padre, 'nomina': nomina, 'puro': puro,
-                                'signo': celdas[terc[0]]['regla']['signo'] if terc else 1})
+                                'nit_col': nit_col, 'signo': signo_bloque or 1})
+
+        # ── filas con datos DEBAJO del rango que suma el total (error típico de la plantilla) ──
+        for b in bloques:
+            fuera = []
+            for r in range(b['fin'] + 1, min(max_fila, b['fin'] + 400) + 1):
+                v = ws.cell(r, col).value
+                if es_formula(v):
+                    break          # empieza otra sección
+                if es_numero(v) and abs(v) > TOL and etiqueta_valor(vals, ws, r, col):
+                    fuera.append(r)
+            # una sola fila suele ser un renglón aparte (p.ej. "Provisión"); varias seguidas son el bloque que siguió creciendo
+            if len(fuera) >= 3:
+                reporte.setdefault('advertencias', []).append(
+                    f"{ws.title}: el total de la fila {b['fila_total']} suma hasta la fila {b['fin']}, pero hay {len(fuera)} filas con valores "
+                    f"más abajo (desde la {fuera[0]}) que NO entran en el total. Revisa el rango de esa fórmula en tu ESF.")
+
+        # ── reglas de la contadora para esta hoja ──
+        for rg in reglas.get('celdas', []):
+            if norm(rg.get('hoja', '')) != norm(ws.title):
+                continue
+            objetivo = []
+            if rg.get('fila'):
+                objetivo = [int(rg['fila'])]
+            elif rg.get('etiqueta'):
+                objetivo = [r for r in range(1, max_fila + 1) if norm(rg['etiqueta']) in norm(etiqueta_valor(vals, ws, r, col))]
+                objetivo = objetivo[:1]
+            for r in objetivo:
+                prev = celdas.get(r, {})
+                if prev.get('tipo'):
+                    cont[prev['tipo']] -= 1
+                cont['BALANCE'] += 1
+                reporte['manual'] = [m for m in reporte['manual'] if not (m['hoja'] == ws.title and m['fila'] == r)]
+                celdas[r] = {'tipo': 'BALANCE', 'etiqueta': etiqueta_valor(vals, ws, r, col), 'regla': rg['regla'],
+                             'valor_base': prev.get('valor_base', prev.get('valor')), 'origen': 'contadora'}
+                reporte.setdefault('reglas_aplicadas', []).append({'hoja': ws.title, 'fila': r, 'etiqueta': celdas[r]['etiqueta'], 'regla': rg['regla']})
+        for rg in reglas.get('bloques', []):
+            if norm(rg.get('hoja', '')) != norm(ws.title):
+                continue
+            padre = rg['padre'] if isinstance(rg['padre'], list) else [rg['padre']]
+            encontrado = False
+            for b in bloques:
+                if b['fila_total'] == int(rg.get('fila_total', -1)) or b['inicio'] == int(rg.get('inicio', -1)):
+                    encontrado = True
+                    bo = next((x for x in bloques_out if x['fila_total'] == b['fila_total']), None)
+                    if bo is None:
+                        bo = {'fila_total': b['fila_total'], 'inicio': b['inicio'], 'fin': b['fin'], 'nomina': {}, 'puro': True, 'nit_col': None, 'signo': rg.get('signo', 1)}
+                        bloques_out.append(bo)
+                    bo['cuenta_padre'] = padre
+                    bo['origen'] = 'contadora'
+                    # re-vincular nómina y reglas de las filas por NIT con la nueva padre
+                    tb_all = bal.terceros_bajo(padre)
+                    for r in range(b['inicio'], b['fin'] + 1):
+                        nit = bo['nomina'].get(str(r), {}).get('nit')
+                        if bo.get('nit_col') and es_nit(ws.cell(r, bo['nit_col']).value):
+                            nit = nit_texto(ws.cell(r, bo['nit_col']).value)
+                        if not nit:
+                            continue
+                        et = etiqueta_valor(vals, ws, r, col)
+                        bo['nomina'][str(r)] = {'etiqueta': et, 'nit': nit}
+                        tb = tb_all.get(nit)
+                        celdas[r] = {'tipo': 'BALANCE', 'etiqueta': et, 'origen': 'contadora',
+                                     'regla': {'tipo': 'tercero', 'codigos': tb['codigos'] if tb else padre, 'nit': nit,
+                                               'campo': 'sf', 'signo': rg.get('signo', bo.get('signo', 1)), 'nombre': tb['nombre'] if tb else et}}
+                    reporte.setdefault('reglas_aplicadas', []).append({'hoja': ws.title, 'fila': b['fila_total'], 'etiqueta': f"bloque {b['inicio']}-{b['fin']}", 'regla': {'padre': padre}})
+            if not encontrado:
+                reporte.setdefault('advertencias', []).append(f"Regla de bloque en '{ws.title}' (fila_total {rg.get('fila_total')}) no encontró un SUM en esa fila.")
+        if any(norm(x) == norm(ws.title) for x in reglas.get('sin_terceros', [])):
+            bloques_out = []   # la contadora no quiere filas de terceros en esta hoja
 
         molde['hojas'][ws.title] = {
             'col_actual': col, 'fila_mes': p['fila_mes'], 'fila_anio': p['fila_anio'], 'col_anio': p['col_anio'],
@@ -1043,6 +1244,7 @@ def aprender(esf_path, balance_path, molde_out):
                         anexos[hoja_ref].add(f"{nombre}!{ws.cell(int(fila_s), h['col_actual']).coordinate}")
     reporte['anexos'] = [{'hoja': k, 'usada_en': sorted(v)[:5]} for k, v in anexos.items()]
     molde['anexos'] = sorted(anexos)
+    molde['reglas'] = reglas
 
     # ── cobertura: subcuentas del balance con saldo que ningún renglón usa ──
     def cubierto(cod):
@@ -1186,7 +1388,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
     nuevo_anio, nuevo_mes = bal.meta['anio'], bal.meta['mes']
     base = molde['periodo_base']
     reporte = {'periodo_nuevo': {'anio': nuevo_anio, 'mes': nuevo_mes}, 'periodo_anterior': base,
-               'hojas': {}, 'revisar': [], 'terceros_nuevos': [], 'sin_ubicar': [], 'advertencias': []}
+               'hojas': {}, 'revisar': [], 'terceros_nuevos': [], 'terceros_sin_fila': [], 'sin_ubicar': [], 'advertencias': []}
 
     if (nuevo_anio * 100 + nuevo_mes) <= (base['anio'] * 100 + base['mes']):
         raise SystemExit(
@@ -1276,7 +1478,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 
         # encabezados
         fm = p['fila_mes']
-        mes_txt = texto_mes(nuevo_mes, ws.cell(fm, ca).value)
+        mes_txt = texto_mes(nuevo_mes, ws.cell(fm, ca).value, nuevo_anio)
         if pl['modo'] == 'insertar':
             ws.cell(fm, cm).value = mes_txt
         # textos de encabezado que mencionan el mes anterior ("ACUMULADO A ABR") → mes nuevo
@@ -1307,7 +1509,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 
         # celdas
         bloques = h.get('bloques', [])
-        for fila_s, c in h['celdas'].items():
+        escritos = {}   # (nit, cuentas) → fila donde ya se escribió este mes
+        for fila_s, c in sorted(h['celdas'].items(), key=lambda kv: int(kv[0])):
             r = int(fila_s)
             tipo = c['tipo']
             dst = ws.cell(r, cm)
@@ -1322,6 +1525,20 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             elif tipo == 'BALANCE':
                 val, ok = bal.valor(c['regla'])
                 val = round(val, 2) if ok else 0
+                if c['regla']['tipo'] == 'tercero' and (not ok or abs(val) <= 0.004):
+                    # tercero sin saldo este mes: la celda queda vacía, como lo hace la contadora
+                    dst.value = None
+                    cont['BALANCE'] += 1
+                    continue
+                if c['regla']['tipo'] == 'tercero':
+                    clave = (c['regla']['nit'], tuple(sorted(cc[:6] for cc in c['regla']['codigos'])))
+                    if clave in escritos:
+                        # el mismo tercero ya tiene su saldo en otra fila de esta hoja (fila repetida en la plantilla)
+                        dst.value = None
+                        reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'], 'tipo': 'duplicado',
+                                                   'detalle': f"El tercero NIT {c['regla']['nit']} ya está en la fila {escritos[clave]}; esta fila repetida se dejó vacía."})
+                        continue
+                    escritos[clave] = r
                 if c.get('ajuste'):
                     # fórmula con ajuste a mano: número nuevo del balance + el ajuste de ella, y se avisa.
                     # Se parte de la fórmula viva del mes anterior (ya con referencias corridas), se cambia
@@ -1363,6 +1580,37 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             elif tipo == 'TEXTO':
                 dst.value = c['valor']
 
+        # 3b) terceros ya conocidos (con fila) que este mes traen saldo y el mes anterior estaban vacíos
+        def codigos_cubiertos(b):
+            out = []
+            for fila_s in range(b['inicio'], b['fin'] + 1):
+                c = h['celdas'].get(str(fila_s))
+                if c and c['tipo'] == 'BALANCE' and c['regla']['tipo'] in ('cuenta', 'suma', 'resto'):
+                    out += [c['regla']['codigo']] if 'codigo' in c['regla'] else c['regla']['codigos']
+            return out
+        for b in bloques:
+            tb_all = bal.terceros_bajo(b['cuenta_padre'])
+            cubiertos_b = codigos_cubiertos(b)
+            for fila_s, info in b['nomina'].items():
+                nit = info.get('nit')
+                if not nit or fila_s in h['celdas']:
+                    continue
+                t = tb_all.get(nit)
+                if t and cubiertos_b:
+                    libres = [cc for cc in t['codigos'] if not any(cc.startswith(k) for k in cubiertos_b)]
+                    t = dict(t, codigos=libres, sf=sum(bal.terceros[cc][nit]['sf'] for cc in libres)) if libres else None
+                if t and abs(t['sf']) > TOL:
+                    clave = (nit, tuple(sorted(cc[:6] for cc in t['codigos'])))
+                    if clave in escritos:
+                        continue   # ya escrito en otra fila de la hoja
+                    escritos[clave] = int(fila_s)
+                    r = int(fila_s)
+                    ws.cell(r, cm).value = round(b.get('signo', 1) * t['sf'], 2)
+                    h['celdas'][fila_s] = {'tipo': 'BALANCE', 'etiqueta': info.get('etiqueta', ''),
+                                           'regla': {'tipo': 'tercero', 'codigos': t['codigos'], 'nit': nit, 'campo': 'sf',
+                                                     'signo': b.get('signo', 1), 'nombre': t['nombre']}}
+                    cont['BALANCE'] += 1
+
         # 4) terceros nuevos por bloque → insertar filas dentro del bloque (en orden alfabético)
         nits_hoja = set()
         for bb in bloques:
@@ -1372,16 +1620,59 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 nits_hoja.add(c['regla']['nit'])
             if c['tipo'] == 'BALANCE' and c['regla']['tipo'] == 'resto':
                 nits_hoja.update(c['regla'].get('excluir_nits', []))
-        for b in sorted(bloques, key=lambda b: -b['inicio']):
-            if not b.get('puro', True):
+        # ¿en qué bloques aparece cada subcuenta (6 díg.)? Si una subcuenta está repartida entre varios
+        # bloques (ej. terceros de 2380 en "Otros" y en "Acreedores varios"), es criterio de la contadora
+        # dónde va cada tercero nuevo: no se inserta, se lista para que ella decida.
+        # filas (fuera de cada bloque) donde aparecen terceros de cada subcuenta
+        filas_por_sub = defaultdict(set)
+        rangos_bloques = [(bb['inicio'], bb['fin']) for bb in bloques]
+        # también cuentan los bloques "sin padre" (mezclan cuentas): se detectan por su SUM
+        for bb in detectar_bloques(ws, cm, min(ws.max_row, MAX_FILAS)):
+            rangos_bloques.append((bb['inicio'], bb['fin']))
+        for fila_s, c in h['celdas'].items():
+            if c['tipo'] == 'BALANCE' and c['regla']['tipo'] == 'tercero':
+                f = int(fila_s)
+                if any(a <= f <= z for a, z in rangos_bloques):   # solo filas que están dentro de algún bloque
+                    for cc in c['regla']['codigos']:
+                        filas_por_sub[cc[:6]].add(f)
+        terceros_sin_fila = []
+        for i_b, b in sorted(enumerate(bloques), key=lambda x: -x[1]['inicio']):
+            cp = b['cuenta_padre']
+            prefijos = cp if isinstance(cp, list) else [cp]
+            repartida = b.get('origen') != 'contadora' and any(
+                any(f < b['inicio'] or f > b['fin'] for f in filas_por_sub.get(pf[:6], set()))
+                for pf in prefijos)
+            cubierto_por_contadora = any(
+                bb is not b and bb.get('origen') == 'contadora' and
+                any(pf[:6] == q[:6] for pf in prefijos for q in (bb['cuenta_padre'] if isinstance(bb['cuenta_padre'], list) else [bb['cuenta_padre']]))
+                for bb in bloques)
+            if cubierto_por_contadora:
                 continue
             nits_conocidos = nits_hoja
+            # códigos que un renglón a nivel de cuenta DENTRO del bloque ya incluye (ej. "Remisiones" = 220506):
+            # los terceros de esos códigos no se insertan, ya están sumados ahí
+            cubiertos = codigos_cubiertos(b)
             nuevos = []
-            for nit, t in bal.terceros_bajo(b['cuenta_padre']).items():
-                if nit in nits_conocidos or abs(t['sf']) <= TOL:
+            for nit, t in bal.terceros_bajo(cp).items():
+                if nit in nits_conocidos:
+                    continue
+                if cubiertos:
+                    cods_libres = [cc for cc in t['codigos'] if not any(cc.startswith(k) for k in cubiertos)]
+                    if not cods_libres:
+                        continue
+                    t = dict(t, codigos=cods_libres,
+                             sf=sum(bal.terceros[cc][nit]['sf'] for cc in cods_libres),
+                             mov=sum(bal.terceros[cc][nit]['mov'] for cc in cods_libres))
+                if abs(t['sf']) <= TOL:
                     continue
                 nuevos.append((nit, t))
             if not nuevos:
+                continue
+            if not b.get('puro', True) or repartida:
+                for nit, t in nuevos:
+                    terceros_sin_fila.append({'hoja': nombre, 'nit': nit, 'nombre': proper(t['nombre']), 'valor': round(t['sf'], 2),
+                                              'cuenta': ','.join(sorted({c[:6] for c in t['codigos']})),
+                                              'motivo': 'la cuenta está repartida en varios bloques; decide en cuál va' if repartida else 'el bloque ya tiene un renglón a nivel de cuenta que lo incluye'})
                 continue
             nuevos.sort(key=lambda x: norm(proper(x[1]['nombre'])))
             # posición alfabética dentro del bloque; nunca en la primera fila (para que el SUM se expanda)
@@ -1408,7 +1699,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                         lambda m: f"SUM({letra}{m.group(1)}:{letra}{int(m.group(2)) + n})", ft, flags=re.I)
             ref_row = fila_ins - 1
             col_et = 1
-            for cc in range(1, cm):
+            for cc in range((b.get('nit_col') or 0) + 1, cm):
                 if isinstance(ws.cell(ref_row, cc).value, str):
                     col_et = cc
                     break
@@ -1416,11 +1707,13 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 rr = fila_ins + i
                 for cc in range(1, min(ws.max_column, 60) + 1):
                     copiar_estilo(ws.cell(ref_row, cc), ws.cell(rr, cc))
-                ws.cell(rr, col_et).value = proper(t['nombre'])
+                ws.cell(rr, col_et).value = proper(t['nombre']) if not b.get('nit_col') else str(t['nombre']).strip()
+                if b.get('nit_col'):
+                    ws.cell(rr, b['nit_col']).value = int(nit) if nit.isdigit() else nit
                 ws.cell(rr, cm).value = round(b.get('signo', 1) * t['sf'], 2)
                 reporte['terceros_nuevos'].append({'hoja': nombre, 'celda': ws.cell(rr, cm).coordinate, 'nit': nit,
                                                    'nombre': proper(t['nombre']), 'valor': round(t['sf'], 2),
-                                                   'cuenta': b['cuenta_padre']})
+                                                   'cuenta': ','.join(b['cuenta_padre']) if isinstance(b['cuenta_padre'], list) else b['cuenta_padre']})
             # correr en el molde todo lo que quedó debajo de la inserción (en esta hoja)
             def corre(x):
                 return x + n if x >= fila_ins else x
@@ -1436,6 +1729,14 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                                                   'regla': {'tipo': 'tercero', 'codigos': t['codigos'], 'nit': nit,
                                                             'campo': 'sf', 'signo': b.get('signo', 1), 'nombre': t['nombre']}}
 
+        if terceros_sin_fila:
+            reporte.setdefault('terceros_sin_fila', []).extend(terceros_sin_fila)
+            # los que ya están incluidos por un renglón de cuenta no son un faltante; los repartidos sí
+            n_rep = sum(1 for x in terceros_sin_fila if 'repartida' in x['motivo'])
+            if n_rep:
+                reporte['advertencias'].append(
+                    f"{nombre}: {n_rep} tercero(s) nuevo(s) con saldo no tienen fila porque su cuenta está repartida entre varios bloques "
+                    f"(ver 'terceros sin fila'). Agrégalos donde correspondan; mientras tanto el total de esa cuenta queda incompleto.")
         reporte['hojas'][nombre] = dict(cont)
         # actualizar molde: nueva columna actual
         h['col_actual'] = cm
@@ -1456,7 +1757,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 else:
                     codigos_usados.update(rg['codigos'])
         for b in h.get('bloques', []):
-            codigos_usados.add(b['cuenta_padre'])
+            cp = b['cuenta_padre']
+            codigos_usados.update(cp if isinstance(cp, list) else [cp])
 
     def cubierto(cod):
         return any(u == cod or cod.startswith(u) or u.startswith(cod) for u in codigos_usados)
@@ -1479,6 +1781,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
         'celdas_balance': sum(c.get('BALANCE', 0) for c in reporte['hojas'].values()),
         'celdas_formula': sum(c.get('FORMULA', 0) + c.get('CADENA', 0) for c in reporte['hojas'].values()),
         'revisar': len(reporte['revisar']), 'terceros_nuevos': len(reporte['terceros_nuevos']),
+        'terceros_sin_fila': len(reporte.get('terceros_sin_fila', [])),
         'sin_ubicar': len(reporte['sin_ubicar']), 'hojas': len(reporte['hojas']),
     }
     print(json.dumps({'ok': True, 'reporte': reporte}, ensure_ascii=False))
@@ -1488,8 +1791,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 if __name__ == '__main__':
     args = sys.argv[1:]
     try:
-        if len(args) == 4 and args[0] == 'aprender':
-            aprender(args[1], args[2], args[3])
+        if len(args) in (4, 5) and args[0] == 'aprender':
+            aprender(args[1], args[2], args[3], args[4] if len(args) == 5 else None)
         elif len(args) == 5 and args[0] == 'extender':
             extender(args[1], args[2], args[3], args[4])
         else:

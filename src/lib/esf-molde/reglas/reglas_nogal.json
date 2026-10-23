@@ -1,0 +1,27 @@
+{
+    "_comentario": "Reglas de la contadora (Luz) para EL NOGAL. Se pasan a molde.py aprender como 5to argumento. Códigos del balance SIESA.",
+    "celdas": [
+      { "hoja": "INVENTARIO", "etiqueta": "Contable",
+        "regla": { "tipo": "cuenta", "codigo": "1435", "campo": "sf", "signo": 1 },
+        "nota": "Inventario = saldo final de la cuenta 1435" },
+      { "hoja": "NOTAS ER", "etiqueta": "Costo de venta materiales",
+        "regla": { "tipo": "suma", "codigos": ["61354201", "61354205", "61354210"], "campo": "mov", "signo": 1 },
+        "nota": "Costo de venta materiales de construcción = movimiento del mes de 61354201+61354205+61354210" },
+      { "hoja": "NOTAS ER", "etiqueta": "Costo de venta Concreto",
+        "regla": { "tipo": "suma", "codigos": ["61205401", "61205402"], "campo": "mov", "signo": 1 },
+        "nota": "Costo de materiales de concreto = movimiento de 61205401+61205402" },
+      { "hoja": "NOTAS ER", "etiqueta": "Costos de produccion Concreto",
+        "regla": { "tipo": "cuenta", "codigo": "7", "campo": "mov", "signo": 1 },
+        "nota": "Costo de producción de concreto = movimiento de la clase 7" }
+    ],
+    "bloques": [
+      { "hoja": "ANEXO 1 CLIENTES.ok  ", "fila_total": 9, "padre": ["13050501"], "signo": 1,
+        "nota": "Anexo 1 clientes: por NIT desde 13050501" },
+      { "hoja": "ANEXO 2 ANTICIPOS.ok", "fila_total": 9, "padre": ["28050501", "28059901"], "signo": -1,
+        "nota": "Anexo 2 anticipos: por NIT desde 28050501 y 28059901" },
+      { "hoja": "CXC", "fila_total": 371, "padre": ["13050502", "13652501"], "signo": 1,
+        "nota": "Préstamos a trabajadores = clientes empleados 13050502 + 13652501, por NIT; así quedan fuera de Clientes nacionales" }
+    ],
+    "sin_terceros": ["NOTAS ER"],
+    "_sin_terceros_nota": "La contadora pidió que en las notas del ERI no se agreguen filas de terceros"
+  }
