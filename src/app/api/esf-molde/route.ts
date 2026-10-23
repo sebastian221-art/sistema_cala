@@ -117,7 +117,18 @@ export async function POST(req: NextRequest) {
       await writeFile(esfPath, esfBuf)
       const moldePath = join(dir, 'molde.json')
 
-      const res = await runPython(['aprender', esfPath, balancePath, moldePath])
+      // Reglas de la contadora (JSON opcional): celdas con cuenta fija, bloques por NIT, hojas sin terceros
+      const args = ['aprender', esfPath, balancePath, moldePath]
+      const reglasRaw = String(form.get('reglas') ?? '').trim()
+      if (reglasRaw) {
+        try { JSON.parse(reglasRaw) } catch {
+          return NextResponse.json({ ok: false, error: 'Las reglas de la contadora no son un JSON válido.' }, { status: 400 })
+        }
+        const reglasPath = join(dir, 'reglas.json')
+        await writeFile(reglasPath, reglasRaw, 'utf-8')
+        args.push(reglasPath)
+      }
+      const res = await runPython(args)
       const molde = JSON.parse(await readFile(moldePath, 'utf-8'))
       const { anio, mes } = res.periodo_base as { anio: number; mes: number }
 

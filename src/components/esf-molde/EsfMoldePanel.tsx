@@ -26,6 +26,7 @@ interface Version extends Empresa {}
 
 interface ReporteAprender {
   resumen: Record<string, any>
+  reglas_aplicadas?: { hoja: string; fila: number; etiqueta: string; regla: any }[]
   hojas: Record<string, Record<string, number>>
   hojas_omitidas: Record<string, string>
   manual: { hoja: string; fila: number; etiqueta: string; valor: any; motivo: string }[]
@@ -39,6 +40,7 @@ interface ReporteExtender {
   periodo_nuevo: { anio: number; mes: number }
   revisar: { hoja: string; celda: string; etiqueta: string; tipo: string; detalle: string }[]
   terceros_nuevos: { hoja: string; celda: string; nit: string; nombre: string; valor: number; cuenta: string }[]
+  terceros_sin_fila?: { hoja: string; nit: string; nombre: string; valor: number; cuenta: string; motivo: string }[]
   sin_ubicar: { codigo: string; nombre: string; saldo: number }[]
   advertencias: string[]
 }
@@ -136,6 +138,11 @@ function ReporteAprendizaje({ r }: { r: ReporteAprender }) {
       {(r.advertencias ?? []).map((a, i) => (
         <div key={i} className="flex gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-300"><AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />{a}</div>
       ))}
+      {(r.reglas_aplicadas?.length ?? 0) > 0 && (
+        <Seccion icon={CheckCircle2} titulo={`Reglas de la contadora aplicadas (${r.reglas_aplicadas!.length})`} tone="ok">
+          <Tabla cols={['Hoja', 'Fila', 'Renglón', 'Regla']} rows={r.reglas_aplicadas!.map(x => [x.hoja, x.fila, x.etiqueta, JSON.stringify(x.regla)])} />
+        </Seccion>
+      )}
       <Seccion icon={AlertTriangle} titulo={`Celdas que ella decide a mano (${r.manual.length})`} tone="warn" vacio="Todo cruza con el balance.">
         {r.manual.length > 0 && (
           <>
@@ -190,6 +197,12 @@ function ReporteExtension({ r }: { r: ReporteExtender }) {
       <Seccion icon={Plus} titulo={`Terceros nuevos con fila propia (${r.terceros_nuevos.length})`} tone="info" vacio="No apareció ningún tercero nuevo.">
         {r.terceros_nuevos.length > 0 && <Tabla cols={['Hoja', 'Celda', 'Tercero', 'NIT', 'Cuenta', 'Valor']} rows={r.terceros_nuevos.map(x => [x.hoja, x.celda, x.nombre, x.nit, x.cuenta, x.valor])} />}
       </Seccion>
+      {(r.terceros_sin_fila?.length ?? 0) > 0 && (
+        <Seccion icon={AlertTriangle} titulo={`Terceros nuevos que tú decides dónde van (${r.terceros_sin_fila!.length})`} tone="warn">
+          <p className="text-xs text-muted-foreground">Su cuenta está repartida en varias secciones de la hoja (o ya la incluye un renglón de cuenta). No se insertaron; agrégalos donde correspondan.</p>
+          <Tabla cols={['Hoja', 'Tercero', 'NIT', 'Cuenta', 'Valor']} rows={r.terceros_sin_fila!.map(x => [x.hoja, x.nombre, x.nit, x.cuenta, x.valor])} />
+        </Seccion>
+      )}
       <Seccion icon={Info} titulo={`Cuentas del balance sin renglón (${r.sin_ubicar.length})`} tone="info" vacio="Todas las subcuentas con saldo tienen renglón.">
         {r.sin_ubicar.length > 0 && <Tabla cols={['Código', 'Cuenta', 'Saldo']} rows={r.sin_ubicar.map(x => [x.codigo, x.nombre, x.saldo])} />}
       </Seccion>
@@ -214,6 +227,8 @@ export function EsfMoldePanel() {
   const [nitManual, setNitManual] = useState('')
   const [nombreManual, setNombreManual] = useState('')
   const [pideDatos, setPideDatos] = useState(false)
+  const [reglas, setReglas] = useState('')
+  const [verReglas, setVerReglas] = useState(false)
   const [repAprender, setRepAprender] = useState<ReporteAprender | null>(null)
   const [resultadoNueva, setResultadoNueva] = useState<{ id: string; empresa: string; nit: string; anio: number; mes: number } | null>(null)
 
@@ -268,6 +283,7 @@ export function EsfMoldePanel() {
       fd.append('action', 'aprender'); fd.append('esf', esfFile); fd.append('balance', balFile)
       if (nitManual.trim()) fd.append('nit', nitManual.trim())
       if (nombreManual.trim()) fd.append('nombre_empresa', nombreManual.trim())
+      if (reglas.trim()) fd.append('reglas', reglas.trim())
       const res = await fetch('/api/esf-molde', { method: 'POST', body: fd })
       let d: any = null
       try { d = await res.json() } catch { d = null }
@@ -384,6 +400,16 @@ export function EsfMoldePanel() {
                       <input value={nitManual} onChange={e => setNitManual(e.target.value)} placeholder="NIT (ej. 901863483-5)"
                         className="px-3 py-2 rounded-xl border border-border bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/30" />
                     </div>
+                  )}
+                </div>
+                <div className="rounded-xl border border-border p-4 space-y-2">
+                  <button type="button" onClick={() => setVerReglas(v => !v)} className="text-xs font-medium text-muted-foreground hover:text-foreground">
+                    {verReglas ? '▾' : '▸'} Reglas de la contadora (opcional, JSON): renglones con cuenta fija, anexos por NIT, hojas sin terceros
+                  </button>
+                  {verReglas && (
+                    <textarea value={reglas} onChange={e => setReglas(e.target.value)} rows={8} spellCheck={false}
+                      placeholder={'{\n  "celdas": [ { "hoja": "INVENTARIO", "etiqueta": "Contable", "regla": { "tipo": "cuenta", "codigo": "1435", "campo": "sf", "signo": 1 } } ],\n  "bloques": [ { "hoja": "ANEXO 1", "fila_total": 9, "padre": ["13050501"], "signo": 1 } ],\n  "sin_terceros": ["NOTAS ER"]\n}'}
+                      className="w-full px-3 py-2 rounded-xl border border-border bg-background text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary/30" />
                   )}
                 </div>
                 <button onClick={aprender} disabled={procesando || !esfFile || !balFile}

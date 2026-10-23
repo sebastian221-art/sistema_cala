@@ -74,3 +74,26 @@ npx tsx -e "import {readFileSync,writeFileSync} from 'fs';import {parsearBalance
 python3 src/lib/esf-molde/molde.py aprender ESF.xlsx bal.json molde.json
 python3 src/lib/esf-molde/molde.py extender ESF.xlsx molde.json bal_mes_nuevo.json ESF_nuevo.xlsx
 ```
+
+## Reglas de la contadora (opcional)
+
+Un JSON por empresa (ej. `src/lib/esf-molde/reglas/reglas_nogal.json`) que se pega en "Nueva empresa →
+Reglas de la contadora" o se pasa como 5.º argumento a `molde.py aprender`. Sirve para lo que el cruce
+automático no puede saber:
+
+- `celdas`: renglón con cuenta fija. `{"hoja","etiqueta"|"fila","regla":{"tipo":"cuenta"|"suma","codigo"|"codigos","campo":"sf"|"mov","signo":1|-1}}`
+  (`sf` = saldo final, para balance; `mov` = movimiento del mes, para ERI).
+- `bloques`: lista de terceros por NIT desde una(s) cuenta(s). `{"hoja","fila_total","padre":["13050501"],"signo":1}`.
+  La hoja debe tener una columna con el NIT de cada fila (anexos de cartera).
+- `sin_terceros`: hojas donde nunca se insertan filas de terceros nuevos (ej. `["NOTAS ER"]`).
+
+Para cambiar las reglas de una empresa ya registrada: borrar la empresa en el panel y registrarla de nuevo
+con el ESF + balance del mes en que va + el JSON.
+
+## Qué hace cuando no puede decidir
+
+- Tercero nuevo cuya cuenta está repartida en varias secciones de la hoja (ej. 2380 en "Otros" y en
+  "Acreedores varios"): no lo inserta; lo lista en "Terceros nuevos que tú decides dónde van".
+- Tercero repetido en dos filas de la plantilla: escribe el saldo una sola vez y marca la otra fila.
+- Filas con valores debajo del rango del total (`SUM` que se quedó corto): avisa, no cambia la fórmula.
+- Hojas sin columnas de mes que alimentan el ESF (ej. `REV`): avisa que debe actualizarlas a mano.
