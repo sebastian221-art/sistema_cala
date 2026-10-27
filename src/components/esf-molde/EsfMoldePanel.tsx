@@ -5,7 +5,7 @@
 //   Pantalla 1: lista de empresas con molde + botón "Nueva empresa".
 //   Nueva empresa: sube ESF histórico + balance del mismo mes → APRENDER
 //                  → muestra el reporte de cruce (qué se aprendió, qué es manual).
-//   Empresa existente: versiones (descargar/borrar) + "Agregar mes": sube el
+//   Empresa existente: versiones (descargar/borrar), "Borrar empresa" + "Agregar mes": sube el
 //                  balance nuevo → EXTENDER → reporte de revisión + descarga.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -275,6 +275,22 @@ export function EsfMoldePanel() {
     cargarEmpresas()
   }
 
+  const [borrandoEmpresa, setBorrandoEmpresa] = useState<string | null>(null)
+  const borrarEmpresa = async (e: Empresa) => {
+    const nombre = e.nombre_empresa ?? e.nit
+    if (!confirm(`¿Borrar la empresa ${nombre} (NIT ${e.nit || 'sin NIT'})?\n\nSe borran TODAS sus versiones del ESF y el molde aprendido. No se puede deshacer.`)) return
+    setBorrandoEmpresa(e.nit)
+    try {
+      const d = await (await fetch(`/api/esf-molde?nit=${encodeURIComponent(e.nit ?? '')}`, { method: 'DELETE' })).json()
+      if (!d.ok) { toast.error(d.error ?? 'No se pudo borrar la empresa'); return }
+      toast.success(`Empresa borrada (${d.borradas} versión${d.borradas === 1 ? '' : 'es'})`)
+      if (empresa?.nit === e.nit) volver()
+      cargarEmpresas()
+    } catch {
+      toast.error('No se pudo borrar la empresa')
+    } finally { setBorrandoEmpresa(null) }
+  }
+
   const aprender = async () => {
     if (!esfFile || !balFile) { toast.error('Sube el ESF histórico y el balance del mismo mes.'); return }
     setProcesando(true); setRepAprender(null)
@@ -358,14 +374,20 @@ export function EsfMoldePanel() {
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {empresas.map(e => (
-                  <button key={e.nit} onClick={() => abrirEmpresa(e)} className="group flex items-center gap-3 p-4 rounded-xl border border-border hover:border-primary hover:bg-primary/5 transition-all text-left">
+                  <div key={e.nit} role="button" tabIndex={0} onClick={() => abrirEmpresa(e)}
+                    onKeyDown={ev => { if (ev.key === 'Enter') abrirEmpresa(e) }}
+                    className="group flex items-center gap-3 p-4 rounded-xl border border-border hover:border-primary hover:bg-primary/5 transition-all text-left cursor-pointer">
                     <div className="p-2.5 rounded-xl bg-muted group-hover:bg-primary/10"><Building2 className="w-5 h-5 text-muted-foreground group-hover:text-primary" /></div>
                     <div className="min-w-0 flex-1">
                       <p className="font-semibold text-sm text-foreground truncate">{e.nombre_empresa ?? e.nit}</p>
                       <p className="text-xs text-muted-foreground">NIT {e.nit} · va en <span className="font-medium text-foreground">{e.label}</span></p>
                     </div>
+                    <button onClick={ev => { ev.stopPropagation(); borrarEmpresa(e) }} disabled={borrandoEmpresa === e.nit}
+                      title="Borrar empresa" className="p-2 rounded-lg text-muted-foreground hover:bg-red-500/10 hover:text-red-600 disabled:opacity-50">
+                      {borrandoEmpresa === e.nit ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                    </button>
                     <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary" />
-                  </button>
+                  </div>
                 ))}
               </div>
             )}
@@ -440,9 +462,15 @@ export function EsfMoldePanel() {
         {vista === 'empresa' && empresa && (
           <div className="space-y-5">
             <button onClick={volver} className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"><ArrowLeft className="w-4 h-4" /> Volver</button>
-            <div>
-              <h2 className="font-semibold text-foreground">{empresa.nombre_empresa ?? empresa.nit}</h2>
-              <p className="text-sm text-muted-foreground">NIT {empresa.nit} · el ESF va en <b>{versiones[0]?.label ?? empresa.label}</b></p>
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="font-semibold text-foreground">{empresa.nombre_empresa ?? empresa.nit}</h2>
+                <p className="text-sm text-muted-foreground">NIT {empresa.nit} · el ESF va en <b>{versiones[0]?.label ?? empresa.label}</b></p>
+              </div>
+              <button onClick={() => borrarEmpresa(empresa)} disabled={borrandoEmpresa === empresa.nit}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-red-500/30 text-red-600 text-xs font-semibold hover:bg-red-500/10 disabled:opacity-50">
+                {borrandoEmpresa === empresa.nit ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />} Borrar empresa
+              </button>
             </div>
 
             {/* Agregar mes */}
