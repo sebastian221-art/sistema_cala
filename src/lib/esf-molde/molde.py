@@ -719,14 +719,17 @@ def detectar_periodos(ws, getval=None):
     # año de cada columna: la celda de año (en una fila de arriba) con col <= c más cercana
     periodos = []
     anios_arriba = [(r, c, a) for r, c, a in anios if r < fila_mes]
+    fuente_anio = {}     # col → columna de la celda de año que se usó (para saber si es propia del grupo)
     for c, m in cols:
         if (fila_mes, c) in anio_emb:
             periodos.append([c, anio_emb[(fila_mes, c)], m])
+            fuente_anio[c] = None          # año escrito en la misma celda/fecha: no se corrige
             continue
         cand = [(cc, a, r) for r, cc, a in anios_arriba if cc <= c]
         if cand:
             cand.sort(key=lambda x: (-x[0], -x[2]))
             a = cand[0][1]
+            fuente_anio[c] = cand[0][0]
         else:
             a = None
         periodos.append([c, a, m])
@@ -746,15 +749,56 @@ def detectar_periodos(ws, getval=None):
     suben = sum(1 for i in range(1, len(periodos)) if key(periodos[i]) > key(periodos[i - 1]))
     orden = 'reciente_izquierda' if bajan >= suben else 'reciente_derecha'
 
-    # corregir años fuera de secuencia (un grupo sin encabezado de año hereda el año equivocado)
+    # corregir años fuera de secuencia (un grupo sin encabezado de año hereda el año equivocado).
+    # No se tocan los años explícitos: fecha completa (31.08.2026) o año escrito dentro del propio grupo.
+    grupo_de = {}
+    _g = []
+    for pp in periodos:
+        if _g and pp[0] - _g[-1][0] <= 1:
+            _g.append(pp)
+        else:
+            _g = [pp]
+        grupo_de[pp[0]] = _g
+    def _propio(col_):
+        f_ = fuente_anio.get(col_, 0)
+        if f_ is None:
+            return True
+        g_ = grupo_de[col_]
+        return g_[0][0] <= f_ <= g_[-1][0]
     if orden == 'reciente_izquierda':
         for i in range(1, len(periodos)):
+            if _propio(periodos[i][0]):
+                continue
             while key(periodos[i]) > key(periodos[i - 1]) and periodos[i][1] > 1990:
                 periodos[i][1] -= 1
     else:
         for i in range(1, len(periodos)):
+            if _propio(periodos[i][0]):
+                continue
             while key(periodos[i]) < key(periodos[i - 1]) and periodos[i][1] < 2100:
                 periodos[i][1] += 1
+    # grupos de columnas contiguas (separados por una columna vacía)
+    grupos_c = []
+    for pp in periodos:
+        if grupos_c and pp[0] - grupos_c[-1][-1][0] <= 1:
+            grupos_c[-1].append(pp)
+        else:
+            grupos_c.append([pp])
+    corregidos_anio = []
+    # dos grupos con su PROPIO año escrito igual y meses que no siguen (ej. 2026 rotulado '2025'
+    # a la izquierda de 'DICIEMBRE 2025'): el grupo más reciente tiene el año mal escrito → se sube
+    if orden == 'reciente_izquierda' and len(grupos_c) >= 2:
+        for gi in range(len(grupos_c) - 2, -1, -1):
+            izq, der = grupos_c[gi], grupos_c[gi + 1]
+            propio_der = any(fuente_anio.get(x[0]) is not None and der[0][0] <= fuente_anio[x[0]] <= der[-1][0] for x in der)
+            propio_izq = all(fuente_anio.get(x[0]) is not None for x in izq) and \
+                any(izq[0][0] <= fuente_anio[x[0]] <= izq[-1][0] for x in izq)
+            if propio_der and propio_izq and key(izq[-1]) <= key(der[0]):
+                antes = izq[0][1]
+                while key(izq[-1]) <= key(der[0]):
+                    for x in izq:
+                        x[1] += 1
+                corregidos_anio.append((izq[0][0], izq[-1][0], antes, izq[0][1]))
     periodos = [tuple(p) for p in periodos]
 
     # ¿qué columnas tienen datos? (números distintos de cero, con valores cacheados si hay)
@@ -789,7 +833,8 @@ def detectar_periodos(ws, getval=None):
     mx = max(key(p) for p in con_datos)
     info = {'fila_mes': fila_mes, 'orden': orden, 'periodos': periodos, 'datos': datos,
             'anios_arriba': anios_arriba, 'ws': ws, 'fila_fecha': fila_fecha,
-            'acumuladas': sorted(acumuladas)}
+            'acumuladas': sorted(acumuladas), 'corregidos_anio': corregidos_anio,
+            'duros': duros}
     fijar_actual(info, mx)
     return info
 
@@ -999,6 +1044,36 @@ def cierre_de_anio(formula, fila, letra_ant, etiqueta, fila_ejercicio):
     return None, None
 
 
+def normalizar_resultado(formula, fila, letra_ant, etiqueta, hojas_eri, col_mes_por_hoja):
+    """Meses 2..12 en el balance general (plantillas cuyo enero quedó con la fórmula de cierre):
+    - 'Resultado del ejercicio' que solo trae el resultado del mes del ERI → + mes anterior (acumulado del año)
+    - 'Ejercicios anteriores' = anteriores + resultado del mes anterior (cierre) → solo el mes anterior"""
+    if not es_formula(formula) or not etiqueta:
+        return None, None
+    et = norm(etiqueta)
+    try:
+        toks = [t for t in Tokenizer(formula).items if t.type != Token.WSPACE]
+    except Exception:
+        return None, None
+    ops = [t for t in toks if t.type == Token.OPERAND and t.subtype == Token.RANGE]
+    propia = f'{letra_ant}{fila}'.upper()
+    tiene_propia = any('!' not in t.value and t.value.replace('$', '').upper() == propia for t in ops)
+    if RE_ANTERIORES.search(et):
+        if len(ops) == 2 and tiene_propia and all('!' not in t.value and REF_RE.match(t.value.replace('$', ''))
+                                                  and REF_RE.match(t.value.replace('$', '')).group(2).upper() == letra_ant.upper() for t in ops) \
+                and len([t for t in toks if t.type == Token.OP_IN]) == 1 and '+' in formula:
+            return f'=+{letra_ant}{fila}', 'ejercicios anteriores no cambian dentro del año (el cierre ya se sumó en enero)'
+        return None, None
+    if RE_EJERCICIO.search(et) and not tiene_propia:
+        for t in ops:
+            if '!' in t.value:
+                hoja, ref = _split_sheet(t.value)
+                m = REF_RE.match(ref.replace('$', ''))
+                if hoja in hojas_eri and m and m.group(2).upper() == col_mes_por_hoja.get(hoja, '').upper() and len(ops) == 1:
+                    return f"{formula}+{letra_ant}{fila}", 'el resultado del ejercicio se acumula en el año (mes anterior + resultado del mes)'
+    return None, None
+
+
 SEP_POR_HOJA = {}    # columna separadora (cambio de año) por hoja, para no apuntar fórmulas a ella
 SEP_HACIA = {'lado': 'viejo'}   # si una referencia cae en el separador: 'viejo' = mes del año anterior, 'nuevo' = año nuevo
 
@@ -1159,6 +1234,25 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
         if p:
             periodos_por_hoja[ws.title] = p
     periodo_max = periodo_global(periodos_por_hoja)
+    # plantillas con los meses futuros ya creados con fórmulas (dan valores aunque estén 'vacías'):
+    # si el libro tiene la columna del mes del balance, ese es el mes actual
+    per_bal = (bal.meta['anio'] or 0) * 100 + (bal.meta['mes'] or 0)
+    if bal.meta['mes'] and periodo_max > per_bal:
+        con_col = [n for n, p in periodos_por_hoja.items()
+                   if any(a * 100 + m == per_bal and p['datos'].get(c) for c, a, m in p['periodos'])]
+        con_duros = [n for n, p in periodos_por_hoja.items()
+                     if any(a * 100 + m == per_bal and p.get('duros', {}).get(c) for c, a, m in p['periodos'])]
+        if con_duros or len(con_col) >= 2:
+            reporte.setdefault('advertencias', []).append(
+                f"La plantilla trae creadas columnas de meses posteriores a {ABREV[bal.meta['mes']]} {bal.meta['anio']} "
+                f"(con fórmulas). Se tomó {ABREV[bal.meta['mes']]} {bal.meta['anio']}, el mes del balance, como mes actual; "
+                f"las columnas siguientes se llenarán mes a mes.")
+            periodo_max = per_bal
+    for nombre, p in periodos_por_hoja.items():
+        for c1, c2, antes, despues in p.get('corregidos_anio', []):
+            reporte.setdefault('advertencias', []).append(
+                f"{nombre}: las columnas {get_column_letter(c1)}–{get_column_letter(c2)} dicen año {antes} pero por el orden de los meses "
+                f"son de {despues}; se tomaron como {despues} (corrige el año en tu plantilla).")
     for p in periodos_por_hoja.values():
         fijar_actual(p, periodo_max)
     for nombre, p in list(periodos_por_hoja.items()):
@@ -1197,6 +1291,9 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
             v = cell.value
             if v is None or r == p['fila_mes'] or r == p['fila_anio']:
                 continue
+            if r < p['fila_mes'] and ((es_numero(v) and float(v).is_integer() and 2000 <= v <= 2100) or
+                                      (isinstance(v, str) and re.fullmatch(r'\s*(19|20)\d{2}\s*', v))):
+                continue      # año del encabezado
             etiqueta = etiqueta_valor(vals, ws, r, col)
             if es_formula(v):
                 refs = referencias_de(v, ws.title)
@@ -2171,6 +2268,18 @@ def extender(esf_path, molde_path, balance_path, salida_path):
     # al cambiar de año, una referencia que cae en el separador es 'el mes anterior' (diciembre);
     # en los meses siguientes, es el mes anterior del año nuevo
     SEP_HACIA['lado'] = 'viejo' if hay_cambio else 'nuevo'
+    # febrero: si enero quedó pegado a una columna vacía que lo separa de diciembre (plantillas que la
+    # contadora armó a mano), esa columna es el separador del año
+    if not hay_cambio and nuevo_mes == 2:
+        for nombre, pl in plan.items():
+            if nombre in SEP_POR_HOJA or pl['p']['mes'] != 1:
+                continue
+            ws_ = wb[nombre]
+            cand = pl['col_ant'] + (1 if pl['p']['orden'] == 'reciente_izquierda' else -1)
+            if 1 <= cand <= ws_.max_column and cand != pl['col_mes'] and \
+                    all(ws_.cell(rr, cand).value is None for rr in range(1, min(ws_.max_row, 300) + 1)):
+                SEP_POR_HOJA[nombre] = cand
+                molde['hojas'][nombre]['col_sep'] = cand
 
     # 3) Por hoja: estilos, encabezados, fórmulas clonadas, valores
     ins_rows_total = defaultdict(list)
@@ -2203,6 +2312,16 @@ def extender(esf_path, molde_path, balance_path, salida_path):
 
         # encabezados
         fm = p['fila_mes']
+        if pl['modo'] == 'llenar':
+            # año mal escrito en la columna que la contadora dejó creada (ej. '2025' sobre FEBRERO 2026)
+            for rr in range(1, min(ws.max_row, MAX_HEADER) + 1):
+                vy = ws.cell(rr, cm).value
+                if rr != fm and ((es_numero(vy) and float(vy).is_integer() and 2000 <= vy <= 2100) or
+                                 (isinstance(vy, str) and re.fullmatch(r'\s*(19|20)\d{2}\s*', vy))):
+                    if int(str(vy).strip().split('.')[0]) != nuevo_anio:
+                        ws.cell(rr, cm).value = nuevo_anio if es_numero(vy) else str(nuevo_anio)
+                        reporte.setdefault('acumulados', []).append(
+                            f"{nombre}!{ws.cell(rr, cm).coordinate}: el año decía {vy}; se corrigió a {nuevo_anio}")
         mes_txt = texto_mes(nuevo_mes, ws.cell(fm, ca).value, nuevo_anio)
         es_fecha = bool(p.get('fila_fecha'))
         if es_fecha:
@@ -2293,6 +2412,13 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                         f_ant, c_src = ws.cell(r, c_dic).value, c_dic
                 if es_formula(f_ant):
                     dst.value = trasladar_formula(f_ant, nombre, c_src, cm, col_min_por_hoja)
+                    if not pl.get('cambia_anio') and nuevo_mes != 1 and not h.get('es_eri'):
+                        f_n, mot_n = normalizar_resultado(dst.value, r, get_column_letter(ca), c.get('etiqueta'),
+                                                          {n2 for n2, h2 in molde['hojas'].items() if h2.get('es_eri')},
+                                                          {n2: get_column_letter(pl2['col_mes']) for n2, pl2 in plan.items()})
+                        if f_n:
+                            reporte.setdefault('cierre_anio', []).append(f"{nombre}!{dst.coordinate} ({c['etiqueta']}): {dst.value} → {f_n}; {mot_n}")
+                            dst.value = f_n
                     if pl.get('cambia_anio') and not h.get('es_eri'):
                         f_ej = next((int(k) for k, x in h['celdas'].items() if x.get('etiqueta')
                                      and RE_EJERCICIO.search(norm(x['etiqueta'])) and not RE_ANTERIORES.search(norm(x['etiqueta']))), None)
@@ -2361,7 +2487,11 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                                            'tipo': 'manual', 'detalle': f"Valor del mes anterior arrastrado ({c['valor']:,.0f}). No viene del balance: revísalo."})
                 cont['MANUAL'] += 1
             elif tipo == 'TEXTO':
-                if not parse_fecha(c['valor']):      # las fechas de encabezado ya se escribieron arriba
+                es_anio_enc = r <= MAX_HEADER and re.fullmatch(r'\s*(19|20)\d{2}\s*', str(c['valor']))
+                if es_anio_enc:
+                    if dst.value is None or str(dst.value).strip() == str(c['valor']).strip():
+                        dst.value = str(nuevo_anio)
+                elif not parse_fecha(c['valor']):      # las fechas de encabezado ya se escribieron arriba
                     dst.value = c['valor']
             elif tipo == 'PENDIENTE':
                 if c.get('enlace'):
@@ -2746,6 +2876,60 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             reporte['advertencias'].append(
                 f"Estado de resultados: {len(reporte['sin_ubicar_eri'])} subcuenta(s) con movimiento este mes no tienen renglón "
                 f"en las notas (neto {tot:,.0f}). Agrégalas a la nota o el resultado del mes no cuadrará con el balance.")
+    # ── ESF: 'resultado del ejercicio' / 'ejercicios anteriores' que no vienen de las notas
+    #    (cadena propia) se enlazan al renglón con el mismo nombre de la hoja de notas ──
+    hojas_bg = [n for n in plan if not molde['hojas'][n].get('es_eri')]
+    for nombre in hojas_bg:
+        pl = plan[nombre]
+        ws = wb[nombre]
+        cm = pl['col_mes']
+        refs_a = Counter()
+        for rr in range(1, min(ws.max_row, MAX_FILAS) + 1):
+            vv = ws.cell(rr, cm).value
+            if es_formula(vv):
+                for hj, cc_, rr_, ab_ in referencias_de(vv, nombre):
+                    if hj != nombre and hj in hojas_bg:
+                        refs_a[hj] += 1
+        if not refs_a:
+            continue
+        notas, n_refs = refs_a.most_common(1)[0]
+        if n_refs < 3:
+            continue
+        cel_n = molde['hojas'][notas]['celdas']
+        for fila_s, c in molde['hojas'][nombre]['celdas'].items():
+            et = norm(c.get('etiqueta') or '')
+            if c['tipo'] not in ('FORMULA', 'CADENA') or not et:
+                continue
+            es_ant = bool(RE_ANTERIORES.search(et))
+            es_ej = bool(RE_EJERCICIO.search(et)) and not es_ant
+            if not (es_ant or es_ej):
+                continue
+            vv = ws.cell(int(fila_s), cm).value
+            if not es_formula(vv):
+                continue
+            hojas_ref = {hj for hj, *_ in referencias_de(vv, nombre) if hj != nombre}
+            # ejercicio: solo si es una cadena propia; anteriores: también si (por error) trae el ERI del mes
+            if hojas_ref and (es_ej or not all(molde['hojas'].get(hj, {}).get('es_eri') for hj in hojas_ref)):
+                continue
+            cands = []
+            for fn, cn in cel_n.items():
+                en = norm(cn.get('etiqueta') or '')
+                if not en or bool(RE_ANTERIORES.search(en)) != es_ant:
+                    continue
+                if not es_ant and not RE_EJERCICIO.search(en):
+                    continue
+                cands.append((similitud_cuenta(et, en), int(fn)))
+            if not cands:
+                continue
+            sc_, fn_ = max(cands)
+            if sc_ < 0.7:
+                continue
+            q_ = f"'{notas}'" if not re.fullmatch(r'\w+', notas) else notas
+            nueva = f"=+{q_}!{get_column_letter(plan[notas]['col_mes'])}{fn_}"
+            reporte.setdefault('cierre_anio', []).append(
+                f"{nombre}!{ws.cell(int(fila_s), cm).coordinate} ({c['etiqueta']}): {vv} → {nueva}; se toma de {notas} como los demás renglones")
+            ws.cell(int(fila_s), cm).value = nueva
+
     # ── cambio de año: los acumulados horizontales no deben mezclar años ──
     #    (al insertar enero al inicio de 'SUM(C13:N13)' quedaba enero + todo el año anterior)
     for nombre, pl in plan.items():
