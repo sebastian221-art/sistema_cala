@@ -15,6 +15,7 @@
 //   GET  ?id=YYY&descargar=1→ el Excel de esa versión
 //   GET  ?id=YYY            → metadatos + reporte de esa versión
 //   DELETE ?id=YYY          → borra una versión (y su archivo)
+//   DELETE ?nit=XXX         → borra la empresa: todas sus versiones y archivos
 //
 // La lógica pesada corre en Python (src/lib/esf-molde/molde.py, openpyxl):
 // insertar columnas corriendo referencias cruzadas entre ~30 hojas no es
@@ -250,12 +251,26 @@ export async function GET(req: NextRequest) {
 export async function DELETE(req: NextRequest) {
   const user = await usuario()
   if (!user) return NextResponse.json({ ok: false, error: 'No autorizado' }, { status: 401 })
-  const id = new URL(req.url).searchParams.get('id')
-  if (!id) return NextResponse.json({ ok: false, error: 'Falta id' }, { status: 400 })
+  const sp = new URL(req.url).searchParams
+  const id = sp.get('id')
+  const nit = sp.get('nit')
+  if (!id && nit === null) return NextResponse.json({ ok: false, error: 'Falta id o nit' }, { status: 400 })
   const admin = createServiceClient()
-  const { data: v } = await admin.from('esf_moldes').select('archivo_path').eq('id', id).single()
-  if (v?.archivo_path) await admin.storage.from(BUCKET).remove([v.archivo_path])
-  const { error } = await admin.from('esf_moldes').delete().eq('id', id)
-  if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
-  return NextResponse.json({ ok: true })
+  try {
+    // una versión, o TODAS las versiones de la empresa (borrar empresa)
+    let q = admin.from('esf_moldes').select('id, archivo_path')
+    if (id) q = q.eq('id', id)
+    else if (nit === '') q = q.or('nit.is.null,nit.eq.')
+    else q = q.eq('nit', nit as string)
+    const { data: filas, error: e1 } = await q
+    if (e1) return NextResponse.json({ ok: false, error: e1.message }, { status: 500 })
+    if (!filas?.length) return NextResponse.json({ ok: false, error: 'No se encontró nada para borrar' }, { status: 404 })
+    const paths = filas.map((f: any) => f.archivo_path).filter(Boolean)
+    for (let i = 0; i < paths.length; i += 100) await admin.storage.from(BUCKET).remove(paths.slice(i, i + 100))
+    const { error } = await admin.from('esf_moldes').delete().in('id', filas.map((f: any) => f.id))
+    if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 })
+    return NextResponse.json({ ok: true, borradas: filas.length })
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e?.message ?? 'Error' }, { status: 500 })
+  }
 }
