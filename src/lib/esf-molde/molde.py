@@ -237,7 +237,7 @@ class Balance:
 STOP_NOMBRE = {'de', 'del', 'la', 'las', 'el', 'los', 'y', 'a', 'al', 'en', 'por', 'para', 'o', 'u', 'e'}
 
 
-ABREV_NOMBRE = {'imp': 'impuesto', 'imptos': 'impuesto', 'prov': 'provision', 'gtos': 'gasto', 'gto': 'gasto',
+ABREV_NOMBRE = {'sueldo': 'salario', 'sueldos': 'salario', 'salarios': 'salario', 'imp': 'impuesto', 'imptos': 'impuesto', 'prov': 'provision', 'gtos': 'gasto', 'gto': 'gasto',
                 'cxp': 'pagar', 'cxc': 'cobrar', 'admon': 'administracion', 'adm': 'administracion',
                 'dep': 'depreciacion', 'amort': 'amortizacion', 'int': 'interes', 'fin': 'financiero'}
 CALIFICADORES = {'menos', 'mas', 'mas/menos', 'total'}
@@ -895,7 +895,8 @@ def desplazar_ref(ref, ins_cols, ins_rows):
         # nuevo quede dentro del acumulado, p.ej. SUM(C8:F8) con mes nuevo en C).
         na = sum(1 for ic in ins_cols if ca >= ic)
         nb = sum(1 for ic in ins_cols if cb >= ic)
-        if ca < cb:
+        if ca < cb or (ca == cb and ra == rb):
+            # (X13:X13 = acumulado de un solo mes, el que deja el cambio de año: también se expande)
             na = sum(1 for ic in ins_cols if ca > ic)   # inicio no se corre si inserción == inicio
         # filas: igual lógica para rangos verticales
         ka = sum(k for (ir, k) in ins_rows if ra >= ir)
@@ -948,6 +949,60 @@ def reescribir_formula(formula, hoja_actual, ins_cols_por_hoja, ins_rows_por_hoj
     return ''.join(out)
 
 
+RE_EJERCICIO = re.compile(r'\b(resultado|resultados|utilidad|utilidades|perdida|perdidas|excedente|excedentes|ganancia)\b.*\b(ejercicio|periodo)\b')
+RE_ANTERIORES = re.compile(r'\b(anterior|anteriores|acumulad[oa]s?)\b')
+
+
+def cierre_de_anio(formula, fila, letra_ant, etiqueta, fila_ejercicio):
+    """Primer mes del año nuevo en el balance general:
+    - 'Resultado del ejercicio' = mes anterior + resultado del mes  → se reinicia (solo el resultado del mes)
+    - 'Resultados de ejercicios anteriores' = mes anterior          → + resultado del ejercicio que cerró
+    Devuelve (fórmula nueva, motivo) o (None, None)."""
+    if not es_formula(formula) or not etiqueta:
+        return None, None
+    et = norm(etiqueta)
+    propia = f'{letra_ant}{fila}'
+    try:
+        toks = [t for t in Tokenizer(formula).items if t.type != Token.WSPACE]
+    except Exception:
+        return None, None
+    def es_propia(t):
+        return t.type == Token.OPERAND and t.subtype == Token.RANGE and '!' not in t.value and t.value.replace('$', '').upper() == propia.upper()
+    n_prop = sum(1 for t in toks if es_propia(t))
+    if n_prop != 1:
+        return None, None
+    if RE_ANTERIORES.search(et):
+        if fila_ejercicio and len([t for t in toks if t.type == Token.OPERAND]) == 1:
+            return f"{formula}+{letra_ant}{fila_ejercicio}", 'se le suma el resultado del ejercicio que cerró'
+        return None, None
+    if RE_EJERCICIO.search(et):
+        out = []
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            if es_propia(t):
+                # quitar el operador que la acompaña
+                if out and out[-1].type == Token.OP_IN and out[-1].value == '+':
+                    out.pop()
+                elif i + 1 < len(toks) and toks[i + 1].type == Token.OP_IN and toks[i + 1].value == '+':
+                    i += 1
+                elif out and out[-1].type == Token.OP_PRE:
+                    out.pop()
+                i += 1
+                continue
+            out.append(t)
+            i += 1
+        cuerpo = ''.join(t.value for t in out).lstrip('+')
+        if not cuerpo or cuerpo == formula.lstrip('='):
+            return None, None
+        return '=+' + cuerpo, 'año nuevo: el resultado del ejercicio arranca de cero (ya no suma el año anterior)'
+    return None, None
+
+
+SEP_POR_HOJA = {}    # columna separadora (cambio de año) por hoja, para no apuntar fórmulas a ella
+SEP_HACIA = {'lado': 'viejo'}   # si una referencia cae en el separador: 'viejo' = mes del año anterior, 'nuevo' = año nuevo
+
+
 def trasladar_formula(formula, hoja_actual, col_origen, col_destino, col_min_por_hoja):
     """
     Clona la fórmula de la columna origen (mes anterior) a la columna destino (mes nuevo).
@@ -983,7 +1038,12 @@ def trasladar_formula(formula, hoja_actual, col_origen, col_destino, col_min_por
                     return part
                 c = column_index_from_string(m.group(2).upper())
                 if c >= col_min and c + delta >= 1:
-                    return f"{get_column_letter(c + delta)}{m.group(3)}{m.group(4)}"
+                    c2 = c + delta
+                    if delta and SEP_POR_HOJA.get(h) == c2:
+                        # caería en la columna separadora del año nuevo: es 'el mes anterior' → salta el separador
+                        paso = (1 if delta > 0 else -1)
+                        c2 = c2 - paso if SEP_HACIA['lado'] == 'viejo' else c2 + paso
+                    return f"{get_column_letter(c2)}{m.group(3)}{m.group(4)}"
                 return part
             partes = ref.split(':')
             nuevo = ':'.join(mov(p) for p in partes)
@@ -1204,8 +1264,10 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
             regla = None
             cands = bal.buscar_valor(v, preferir_mov=es_eri)
             if cands:
-                # preferir el código más específico (largo); entre iguales, el que aún no se usó
-                cands.sort(key=lambda c: (c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
+                # preferir la clase de la hoja (en el balance general 240405 antes que el gasto 540505),
+                # luego el código más específico (largo); entre iguales, el que aún no se usó
+                _cl = '4567' if es_eri else '123'
+                cands.sort(key=lambda c: (c['codigo'][:1] not in _cl, c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
                 regla = cands[0]
                 if regla['campo'] == 'mov' and not es_eri:
                     reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
@@ -2091,6 +2153,24 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             pl['col_mes'] = pl['ins_en'] + (1 if pl['cambia_anio'] else 0)
             pl['col_ant'] = pl['col_vieja']
     col_min_por_hoja = {nombre: min(pl['col_mes'], pl['col_ant']) for nombre, pl in plan.items()}
+    # separador entre años: el que se crea ahora (cambio de año) o el que quedó de un cambio anterior
+    SEP_POR_HOJA.clear()
+    hay_cambio = any(pl.get('cambia_anio') for pl in plan.values())
+    for nombre, pl in plan.items():
+        if pl.get('col_sep'):
+            SEP_POR_HOJA[nombre] = pl['col_sep']
+        elif molde['hojas'][nombre].get('col_sep'):
+            sp_ = molde['hojas'][nombre]['col_sep']
+            if pl['n'] and pl['ins_en'] <= sp_:
+                sp_ += pl['n']
+            molde['hojas'][nombre]['col_sep'] = sp_
+            SEP_POR_HOJA[nombre] = sp_
+    for nombre, pl in plan.items():
+        if pl.get('col_sep'):
+            molde['hojas'][nombre]['col_sep'] = pl['col_sep']
+    # al cambiar de año, una referencia que cae en el separador es 'el mes anterior' (diciembre);
+    # en los meses siguientes, es el mes anterior del año nuevo
+    SEP_HACIA['lado'] = 'viejo' if hay_cambio else 'nuevo'
 
     # 3) Por hoja: estilos, encabezados, fórmulas clonadas, valores
     ins_rows_total = defaultdict(list)
@@ -2204,8 +2284,23 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             dst = ws.cell(r, cm)
             if tipo in ('FORMULA', 'CADENA'):
                 f_ant = ws.cell(r, ca).value
+                c_src = ca
+                if c.pop('cierre', None) and not pl.get('cambia_anio'):
+                    # el mes anterior fue el primero del año (fórmula de cierre): se clona la del último
+                    # mes del año anterior, que está al otro lado de la columna separadora
+                    c_dic = ca + 2 if p['orden'] == 'reciente_izquierda' else ca - 2
+                    if 1 <= c_dic <= ws.max_column and es_formula(ws.cell(r, c_dic).value) and ws.cell(r, ca + (1 if p['orden'] == 'reciente_izquierda' else -1)).value is None:
+                        f_ant, c_src = ws.cell(r, c_dic).value, c_dic
                 if es_formula(f_ant):
-                    dst.value = trasladar_formula(f_ant, nombre, ca, cm, col_min_por_hoja)
+                    dst.value = trasladar_formula(f_ant, nombre, c_src, cm, col_min_por_hoja)
+                    if pl.get('cambia_anio') and not h.get('es_eri'):
+                        f_ej = next((int(k) for k, x in h['celdas'].items() if x.get('etiqueta')
+                                     and RE_EJERCICIO.search(norm(x['etiqueta'])) and not RE_ANTERIORES.search(norm(x['etiqueta']))), None)
+                        f_c, mot_c = cierre_de_anio(dst.value, r, get_column_letter(ca), c.get('etiqueta'), f_ej)
+                        if f_c:
+                            reporte.setdefault('cierre_anio', []).append(f"{nombre}!{dst.coordinate} ({c['etiqueta']}): {dst.value} → {f_c}; {mot_c}")
+                            dst.value = f_c
+                            c['cierre'] = True     # el mes siguiente vuelve a la fórmula normal (la de diciembre)
                     if c.get('ajuste_manual'):
                         reporte['revisar'].append({'hoja': nombre, 'celda': dst.coordinate, 'etiqueta': c['etiqueta'],
                                                    'tipo': 'ajuste_manual', 'detalle': f"La fórmula del mes anterior tenía un ajuste a mano: {c['ajuste_manual']}"})
@@ -2320,8 +2415,15 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 for cod in cand:
                     if cod in ya_tenia and not c.get('por_nombre'):
                         continue      # el mes anterior la cuenta ya tenía valor y el renglón estaba vacío: lo lleva en otro lado
+                    fuera_pref = False
                     if c.get('prefijo') and not cod.startswith(c['prefijo']):
-                        continue
+                        # misma sección del balance (ej. 'Sueldo' en beneficios a empleados → 250505), solo con nombre exacto
+                        if cod[:2] != c['prefijo'][:2]:
+                            continue
+                        ct_, nt_ = contenido_nombre(c['etiqueta'], bal.nombre.get(cod, ''))
+                        if not (ct_ >= 1.0 and nt_ >= 1):
+                            continue
+                        fuera_pref = True
                     sc = similitud_cuenta(c['etiqueta'], bal.nombre.get(cod, ''))
                     if cod.startswith('5405') and re.search(r'\b(imp|impto|impuesto|provision)\b.*\brenta\b', norm(c['etiqueta'])):
                         sc = max(sc, 0.95)       # 'Provisión imp. renta' = gasto de impuesto de renta (5405)
@@ -2333,6 +2435,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                         if ct_ >= 1.0 and nt_ >= 2:
                             sc = max(sc, 0.9)
                     umbral = 0.75 if c.get('prefijo') else 0.92
+                    if fuera_pref:
+                        sc = max(sc, 0.8)
                     if not c.get('prefijo'):
                         cont_, n_ = contenido_nombre(c['etiqueta'], bal.nombre.get(cod, ''))
                         if cont_ >= 1.0 and n_ >= 2:
@@ -2431,9 +2535,19 @@ def extender(esf_path, molde_path, balance_path, salida_path):
         for i_b, b in sorted(enumerate(bloques), key=lambda x: -x[1]['inicio']):
             cp = b['cuenta_padre']
             prefijos = cp if isinstance(cp, list) else [cp]
+            # bloques hermanos MÁS específicos (ej. 'Servicios'=617015 y 'Honorarios'=61701504): sus
+            # códigos son de ellos, no hacen 'repartida' a la cuenta general ni se insertan aquí
+            especificos = set()
+            for bb in bloques:
+                if bb is b:
+                    continue
+                for q in (bb['cuenta_padre'] if isinstance(bb['cuenta_padre'], list) else [bb['cuenta_padre']]):
+                    if any(str(q).startswith(str(pf)) and len(str(q)) > len(str(pf)) for pf in prefijos):
+                        especificos.add(str(q))
             repartida = b.get('origen') != 'contadora' and any(
                 any(f < b['inicio'] or f > b['fin']
-                    for cc, fs in filas_por_cod.items() if cc.startswith(pf) for f in fs)
+                    for cc, fs in filas_por_cod.items()
+                    if cc.startswith(pf) and not any(cc.startswith(sp) for sp in especificos) for f in fs)
                 for pf in prefijos)
             cubierto_por_contadora = any(
                 bb is not b and bb.get('origen') == 'contadora' and
@@ -2463,8 +2577,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             for nit, t in bal.terceros_bajo(cp).items():
                 if nit in nits_conocidos:
                     continue
-                if cubiertos:
-                    cods_libres = [cc for cc in t['codigos'] if not any(cc.startswith(k) for k in cubiertos)]
+                if cubiertos or especificos:
+                    cods_libres = [cc for cc in t['codigos'] if not any(cc.startswith(k) for k in list(cubiertos) + list(especificos))]
                     if not cods_libres:
                         continue
                     t = dict(t, codigos=cods_libres,
@@ -2632,6 +2746,63 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             reporte['advertencias'].append(
                 f"Estado de resultados: {len(reporte['sin_ubicar_eri'])} subcuenta(s) con movimiento este mes no tienen renglón "
                 f"en las notas (neto {tot:,.0f}). Agrégalas a la nota o el resultado del mes no cuadrará con el balance.")
+    # ── cambio de año: los acumulados horizontales no deben mezclar años ──
+    #    (al insertar enero al inicio de 'SUM(C13:N13)' quedaba enero + todo el año anterior)
+    for nombre, pl in plan.items():
+        if not pl.get('cambia_anio') or not pl.get('col_sep'):
+            continue
+        ws = wb[nombre]
+        p = pl['p']
+        cm, cs = pl['col_mes'], pl['col_sep']
+        nuevos_cols = {cm}
+        viejo_lado = (lambda c: c > cs) if p['orden'] == 'reciente_izquierda' else (lambda c: c < cs)
+        nombres_nuevos = {norm(NOMBRE_MES[nuevo_mes]), norm(ABREV[nuevo_mes])}
+
+        def es_col_nueva(cc):
+            v = ws.cell(p['fila_mes'], cc).value
+            if isinstance(v, str) and norm(v).strip() in nombres_nuevos:
+                return True
+            fechas = [parse_fecha(ws.cell(rr, cc).value) for rr in range(1, min(ws.max_row, MAX_HEADER) + 1)]
+            fechas = [f for f in fechas if f]
+            return bool(fechas) and max(fechas)[0] == nuevo_anio
+
+        cambios = 0
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, MAX_FILAS)):
+            for cell in row:
+                v = cell.value
+                if not es_formula(v) or ':' not in v or cell.column in (cm, cs):
+                    continue
+                try:
+                    toks = Tokenizer(v).items
+                except Exception:
+                    continue
+                cambio = False
+                partes = ['=']
+                for t in toks:
+                    val = t.value
+                    if t.type == Token.OPERAND and t.subtype == Token.RANGE and '!' not in val:
+                        ms = [REF_RE.match(x) for x in val.split(':')]
+                        if len(ms) == 2 and all(ms) and ms[0].group(4) == ms[1].group(4):
+                            a = column_index_from_string(ms[0].group(2).upper())
+                            z = column_index_from_string(ms[1].group(2).upper())
+                            a, z = min(a, z), max(a, z)
+                            if a <= cm <= z and any(viejo_lado(c) for c in range(a, z + 1)):
+                                fila = ms[0].group(4)
+                                if es_col_nueva(cell.column):
+                                    val = f"{get_column_letter(cm)}{fila}:{get_column_letter(cm)}{fila}"
+                                else:
+                                    viejos = [c for c in range(a, z + 1) if viejo_lado(c)]
+                                    val = f"{get_column_letter(min(viejos))}{fila}:{get_column_letter(max(viejos))}{fila}"
+                                cambio = True
+                    partes.append(val)
+                if cambio:
+                    cell.value = ''.join(partes)
+                    cambios += 1
+        if cambios:
+            reporte.setdefault('cierre_anio', []).append(
+                f"{nombre}: {cambios} suma(s) acumulada(s) separadas por año (el acumulado del año nuevo arranca en {NOMBRE_MES[nuevo_mes].lower()}; "
+                f"el del año anterior queda solo con sus meses)")
+
     molde['periodo_base'] = {'anio': nuevo_anio, 'mes': nuevo_mes}
     molde['con_valor'] = cuentas_con_valor(bal)
     wb.save(salida_path)
