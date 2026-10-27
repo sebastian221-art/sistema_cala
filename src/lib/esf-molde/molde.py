@@ -298,6 +298,55 @@ def contenido_nombre(etiqueta, nombre_cuenta):
     return hits / len(ta), len(ta)
 
 
+def cuenta_cercana_por_nombre(bal, v, etiqueta, clases, es_eri, usados):
+    """Cuenta del balance con el MISMO nombre que el renglón y un valor casi igual (diferencias de
+    centavos/pesos por redondeo o un ajuste viejo). Devuelve (regla, diferencia) o None."""
+    if not etiqueta or not es_numero(v) or abs(v) < 1000:
+        return None
+    src = bal.mov if es_eri else bal.sf
+    tol = min(max(10.0, abs(v) * 0.001), 50000.0)
+    mejor = None
+    for cod, x in src.items():
+        if cod[:1] not in clases or len(cod) < 4 or abs(x) < TOL:
+            continue
+        dif = abs(abs(x) - abs(v))
+        if dif > tol:
+            continue
+        nom = bal.nombre.get(cod, '')
+        sc = similitud_cuenta(etiqueta, nom)
+        cont_, n_ = contenido_nombre(etiqueta, nom)
+        if sc < 0.75 and not (cont_ >= 1.0 and n_ >= 1):
+            continue
+        clave = (cod in usados, dif, len(cod) != 6, -len(cod))
+        if mejor is None or clave < mejor[0]:
+            mejor = (clave, cod, dif, x)
+    if not mejor:
+        return None
+    _, cod, dif, x = mejor
+    if cod in usados:
+        return None
+    signo = 1 if (x >= 0) == (v >= 0) else -1
+    return {'tipo': 'cuenta', 'codigo': cod, 'campo': 'mov' if es_eri else 'sf', 'signo': signo}, dif
+
+
+ENLACE_RE = re.compile(r"^=\+?'?([^'!]+)'?!\$?([A-Z]{1,3})\$?(\d+)$", re.I)
+
+
+def enlace_de_fila(ws, r, col):
+    """Si en OTROS meses el renglón trae el valor de otra hoja (ej. =+'NOTAS ERI'!H114) y en este
+    mes la contadora dejó un 0 escrito, se recuerda la hoja para enlazar el mes nuevo."""
+    vistos = Counter()
+    for c in range(1, min(ws.max_column, 80) + 1):
+        if c == col:
+            continue
+        v = ws.cell(r, c).value
+        if isinstance(v, str):
+            m = ENLACE_RE.match(v.strip())
+            if m and m.group(1) != ws.title:
+                vistos[m.group(1)] += 1
+    return vistos.most_common(1)[0][0] if vistos else None
+
+
 def cuentas_con_valor(bal):
     """Subcuentas (6 dígitos) con valor en el balance del mes. Si un renglón por nombre estaba vacío
     aunque su cuenta SÍ tenía valor, la contadora lleva ese valor en otro lado: no se llena solo."""
@@ -1096,9 +1145,29 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                 # ¿Alguna constante suelta ES un valor del balance? (ej. =28614668+200000-4276000)
                 # → se trata como BALANCE con ajuste: el número se actualiza, el ajuste se conserva y se avisa.
                 regla_emb = None
+                clases_hoja_ = '4567' if es_eri else '123'
+                v_calc = vals.get(ws.title, r, col)
+                if sueltas and mira_anterior and not es_eri and es_numero(v_calc) and abs(v_calc) > TOL:
+                    # 'mes anterior + lo del mes' cuyo resultado ES el saldo de una cuenta del balance:
+                    # la contadora acumula a mano lo que el balance ya trae acumulado → se toma el saldo
+                    cs_ = [x for x in bal.buscar_valor(v_calc) if x['campo'] == 'sf' and x['codigo'][:1] in clases_hoja_]
+                    if cs_:
+                        cs_.sort(key=lambda c: (c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
+                        regla = cs_[0]
+                        celdas[r] = {'tipo': 'BALANCE', 'etiqueta': etiqueta, 'regla': regla, 'valor_base': v_calc,
+                                     'formula_base': v}
+                        codigos_usados.add(regla['codigo'])
+                        cont['BALANCE'] += 1
+                        reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                                   'motivo': f"la fórmula acumula a mano y su resultado es el saldo de {regla['codigo']} "
+                                                             f"{bal.nombre.get(regla['codigo'], '')}; se toma el saldo del balance"})
+                        continue
                 if sueltas:
                     for i, val, sg in sueltas:
                         cands = bal.buscar_valor(sg * val, preferir_mov=es_eri)
+                        en_clase = [c for c in cands if c['codigo'][:1] in clases_hoja_]
+                        if en_clase:
+                            cands = en_clase
                         if cands:
                             cands.sort(key=lambda c: (c['codigo'] in codigos_usados, len(c['codigo']) != 6, -len(c['codigo'])))
                             regla_emb = (i, cands[0])
@@ -1175,6 +1244,16 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                 celdas[r] = {'tipo': 'CONSTANTE', 'etiqueta': etiqueta, 'valor': v}
                 cont['CONSTANTE'] += 1
                 reporte['constante'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v})
+                continue
+            cerca = cuenta_cercana_por_nombre(bal, v, etiqueta, '4567' if es_eri else '123', es_eri, codigos_usados)
+            if cerca:
+                regla, dif_ = cerca
+                celdas[r] = {'tipo': 'BALANCE', 'etiqueta': etiqueta, 'regla': regla, 'valor_base': v, 'origen': 'aprox'}
+                cont['BALANCE'] += 1
+                codigos_usados.add(regla['codigo'])
+                reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                           'motivo': f"difiere {dif_:,.2f} del saldo de {regla['codigo']} {bal.nombre.get(regla['codigo'], '')}; "
+                                                     f"se vinculó por nombre y desde ahora toma el valor del balance"})
                 continue
             celdas[r] = {'tipo': 'MANUAL', 'etiqueta': etiqueta, 'valor': v}
             cont['MANUAL'] += 1
@@ -1495,7 +1574,10 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                             and celdas[hh].get('origen') != 'contadora']
                 if len(reglas_h) < 2:
                     continue
-                primero = Counter(str(_codigos_regla(c_['regla'])[0])[:1] for hh, c_ in reglas_h)
+                primero = Counter(str(_codigos_regla(c_['regla'])[0])[:1] for hh, c_ in reglas_h
+                                  if str(_codigos_regla(c_['regla'])[0])[:1] in clases_h)
+                if not primero:
+                    continue
                 dom, n_dom = primero.most_common(1)[0]
                 if n_dom < 2:
                     continue
@@ -1503,7 +1585,7 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                                 if str(_codigos_regla(c_['regla'])[0])[:1] == dom).most_common(1)[0][0]
                 for hh, c_ in reglas_h:
                     cods_ = _codigos_regla(c_['regla'])
-                    if str(cods_[0])[:1] == dom or c_['regla']['tipo'] == 'tercero':
+                    if str(cods_[0])[:1] in clases_h or c_['regla']['tipo'] == 'tercero':
                         continue
                     v_ = c_.get('valor_base')
                     nuevo = None
@@ -1661,6 +1743,16 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                     continue
                 c_prev = celdas.get(r)
                 era_cero = False
+                if c_prev and c_prev['tipo'] == 'FORMULA' and es_formula(v):
+                    m_ = re.fullmatch(r'=\+?SUM\(\$?([A-Z]{1,3})\$?(\d+):\$?([A-Z]{1,3})\$?(\d+)\)', v.replace(' ', ''), re.I)
+                    vv_ = vals.get(ws.title, r, col)
+                    if m_ and int(m_.group(2)) == r and int(m_.group(4)) == r and (not es_numero(vv_) or abs(vv_) < 0.005):
+                        c1_, c2_ = column_index_from_string(m_.group(1).upper()), column_index_from_string(m_.group(3).upper())
+                        if not (min(c1_, c2_) <= col <= max(c1_, c2_)):
+                            cont['FORMULA'] -= 1
+                            c_prev = None
+                            era_cero = True
+                            v = None
                 if c_prev and c_prev['tipo'] == 'CONSTANTE' and not c_prev.get('valor'):
                     cont['CONSTANTE'] -= 1
                     c_prev = None
@@ -1682,6 +1774,9 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                 celdas[r] = {'tipo': 'PENDIENTE', 'etiqueta': et, 'prefijo': pref, 'seccion': enc,
                              'campo': campo_h, 'signo': sg_h.most_common(1)[0][0] if sg_h else None,
                              'cero': era_cero}
+                enl_ = enlace_de_fila(ws, r, col)
+                if enl_:
+                    celdas[r]['enlace'] = enl_
                 cont['PENDIENTE'] += 1
             # sección que la contadora dejó COMPLETA en blanco (ej. gastos de administración que ella
             # lleva dentro de la sección de ventas): se marca para no llenarla sola si su cuenta ya tenía valor
@@ -2048,7 +2143,13 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 if len(fechas_col) < 2:
                     continue
                 (r_ini, f_ini), (r_fin, f_fin) = min(fechas_col, key=lambda x: x[1]), max(fechas_col, key=lambda x: x[1])
-                if (f_fin[0], f_fin[1]) == (p['anio'], p['mes']):
+                if f_ini[0] == nuevo_anio and f_ini[1] == 1 and (f_fin[0], f_fin[1]) < (p['anio'], p['mes']):
+                    # acumulado desde enero con la fecha final atrasada (la plantilla no la venía cambiando)
+                    viejo_ = ws.cell(r_fin, c_now).value
+                    ws.cell(r_fin, c_now).value = fecha_como(viejo_, nuevo_anio, nuevo_mes)
+                    reporte.setdefault('acumulados', []).append(
+                        f"{nombre}!{ws.cell(r_fin, c_now).coordinate}: el acumulado decía {viejo_}; ahora {ws.cell(r_fin, c_now).value}")
+                elif (f_fin[0], f_fin[1]) == (p['anio'], p['mes']):
                     if f_ini[0] == nuevo_anio:
                         ws.cell(r_fin, c_now).value = fecha_como(ws.cell(r_fin, c_now).value, nuevo_anio, nuevo_mes)
                         reporte.setdefault('acumulados', []).append(
@@ -2168,6 +2269,26 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 if not parse_fecha(c['valor']):      # las fechas de encabezado ya se escribieron arriba
                     dst.value = c['valor']
             elif tipo == 'PENDIENTE':
+                if c.get('enlace'):
+                    # fila resumen que otros meses trae de otra hoja: se enlaza igual en el mes nuevo
+                    hoja_e = c['enlace']
+                    filas_e = Counter(); cols_e = Counter()
+                    for cc in range(1, min(ws.max_column, 80) + 1):
+                        vv = ws.cell(r, cc).value
+                        m_ = ENLACE_RE.match(vv.strip()) if isinstance(vv, str) else None
+                        if m_ and m_.group(1) == hoja_e and cc != cm:
+                            filas_e[int(m_.group(3))] += 1
+                    for rr in range(1, min(ws.max_row, MAX_FILAS) + 1):
+                        vv = ws.cell(rr, cm).value
+                        m_ = ENLACE_RE.match(vv.strip()) if isinstance(vv, str) else None
+                        if m_ and m_.group(1) == hoja_e:
+                            cols_e[m_.group(2).upper()] += 1
+                    if filas_e and cols_e:
+                        q_ = f"'{hoja_e}'" if not re.fullmatch(r'\w+', hoja_e) else hoja_e
+                        dst.value = f"=+{q_}!{cols_e.most_common(1)[0][0]}{filas_e.most_common(1)[0][0]}"
+                        h['celdas'][str(r)] = {'tipo': 'FORMULA', 'etiqueta': c['etiqueta']}
+                        reporte.setdefault('enlazados', []).append(f"{nombre}!{dst.coordinate} ({c['etiqueta']}) → {dst.value}")
+                        continue
                 if c.get('cero'):
                     dst.value = 0          # la contadora tenía un 0 escrito; si este mes hay movimiento, 3a lo reemplaza
 
@@ -2202,6 +2323,15 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                     if c.get('prefijo') and not cod.startswith(c['prefijo']):
                         continue
                     sc = similitud_cuenta(c['etiqueta'], bal.nombre.get(cod, ''))
+                    if cod.startswith('5405') and re.search(r'\b(imp|impto|impuesto|provision)\b.*\brenta\b', norm(c['etiqueta'])):
+                        sc = max(sc, 0.95)       # 'Provisión imp. renta' = gasto de impuesto de renta (5405)
+                    tb_ = bal.terceros_bajo(cod)
+                    if len(tb_) == 1 and c.get('prefijo'):
+                        # renglón con el nombre del ÚNICO tercero de la cuenta (ej. 'Cámara de Comercio' → 514010)
+                        t_ = next(iter(tb_.values()))
+                        ct_, nt_ = contenido_nombre(c['etiqueta'], t_['nombre'])
+                        if ct_ >= 1.0 and nt_ >= 2:
+                            sc = max(sc, 0.9)
                     umbral = 0.75 if c.get('prefijo') else 0.92
                     if not c.get('prefijo'):
                         cont_, n_ = contenido_nombre(c['etiqueta'], bal.nombre.get(cod, ''))
