@@ -407,11 +407,22 @@ def nit_texto(v):
 
 def similitud(a, b):
     """Similitud simple entre nombres (tokens en común). 0..1"""
-    ta = set(t for t in norm(a).replace('.', ' ').split() if len(t) > 1 and t not in ('sas', 's', 'a', 'de', 'y', 'la', 'el', 'ltda'))
-    tb = set(t for t in norm(b).replace('.', ' ').split() if len(t) > 1 and t not in ('sas', 's', 'a', 'de', 'y', 'la', 'el', 'ltda'))
+    _fuera = ('sas', 's', 'a', 'de', 'y', 'la', 'el', 'ltda', 'limitada')
+    ta = set(t for t in norm(a).replace('.', ' ').split() if len(t) > 1 and t not in _fuera)
+    tb = set(t for t in norm(b).replace('.', ' ').split() if len(t) > 1 and t not in _fuera)
     if not ta or not tb:
         return 0.0
-    return len(ta & tb) / max(len(ta), len(tb))
+    base = len(ta & tb) / max(len(ta), len(tb))
+    # 'Zoom Producciones SAS' vs 'ZOOMPRODUCCIONES LTDA': mismo nombre pegado / sin la razón social
+    ca, cb = ''.join(sorted(ta, key=lambda x: norm(a).find(x))), ''.join(sorted(tb, key=lambda x: norm(b).find(x)))
+    def _suf(x):
+        t = norm(x).replace('.', ' ').replace('limitada', 'ltda')
+        t = re.sub(r'\bs\s*a\s*s\b', 'sas', t)
+        return {w for w in t.split() if w in ('sas', 'ltda', 'sa', 'eu', 'sca', 'cia')}
+    extra = 0.05 if _suf(a) and _suf(a) == _suf(b) else 0.0     # desempate: misma razón social (LTDA vs SAS)
+    if len(ca) >= 6 and len(cb) >= 6 and (ca == cb or ca in cb or cb in ca):
+        return max(base, 0.9) + extra
+    return base + (extra if base > 0 else 0.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1612,6 +1623,28 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                         celdas[r] = {'tipo': 'BALANCE', 'etiqueta': et, 'valor_base': prev.get('valor_base', prev.get('valor')),
                                      'regla': {'tipo': 'tercero', 'codigos': cod_nit, 'nit': nit, 'campo': 'mov' if es_eri else 'sf',
                                                'signo': signo_bloque or 1, 'nombre': tb['nombre'] if tb else et}}
+            # un mismo tercero en dos filas del bloque (ej. 'Zoomproducciones Ltda' OCULTA y 'Zoom Producciones
+            # SAS' visible): se queda la fila que la contadora usa (con valor, o la visible); la otra no se llena
+            por_nit_ = defaultdict(list)
+            for fs_, inf_ in nomina.items():
+                if inf_.get('nit'):
+                    por_nit_[inf_['nit']].append(int(fs_))
+            for nit_d, rs_d in por_nit_.items():
+                if len(rs_d) < 2:
+                    continue
+                def _peso(rr):
+                    c_ = celdas.get(rr) or {}
+                    v_ = vals.get(ws.title, rr, col)
+                    return (c_.get('tipo') == 'BALANCE', es_numero(v_) and abs(v_) > TOL,
+                            not ws.row_dimensions[rr].hidden, -rr)
+                keep = max(rs_d, key=_peso)
+                for rr in rs_d:
+                    if rr != keep:
+                        nomina[str(rr)]['nit'] = None
+                        nomina[str(rr)]['duplicado_de'] = keep
+                        reporte['dudosos'].append({'hoja': ws.title, 'fila': rr, 'etiqueta': nomina[str(rr)]['etiqueta'], 'valor': None,
+                                                   'motivo': f"el mismo tercero (NIT {nit_d}) está también en la fila {keep}"
+                                                             f"{' (esta fila está oculta)' if ws.row_dimensions[rr].hidden else ''}; se llena solo la fila {keep}"})
             if not es_eri:
                 for r in filas:
                     c_ = celdas.get(r)
@@ -2632,10 +2665,32 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                     escritos[clave] = int(fila_s)
                     r = int(fila_s)
                     ws.cell(r, cm).value = round(b.get('signo', 1) * t[cf], 2)
+                    if ws.row_dimensions[r].hidden:
+                        ws.row_dimensions[r].hidden = False
+                        reporte.setdefault('advertencias', []).append(
+                            f"{nombre}: la fila {r} ('{info.get('etiqueta', '')}') estaba OCULTA y ese tercero tiene saldo este mes; se mostró para que la veas.")
                     h['celdas'][fila_s] = {'tipo': 'BALANCE', 'etiqueta': info.get('etiqueta', ''),
                                            'regla': {'tipo': 'tercero', 'codigos': t['codigos'], 'nit': nit, 'campo': cf,
                                                      'signo': b.get('signo', 1), 'nombre': t['nombre']}}
                     cont['BALANCE'] += 1
+
+        # 3c) filas con valor ENTRE el encabezado y el inicio de su SUM (ej. 'Producción' = SUM(C20:C29)
+        #     con terceros en 15..19): el total del mes nuevo se amplía para que no se pierdan
+        for b in bloques:
+            ft, ini = b['fila_total'], b['inicio']
+            if ft >= ini - 1:
+                continue
+            huerf = [rr for rr in range(ft + 1, ini) if es_numero(ws.cell(rr, cm).value) and abs(ws.cell(rr, cm).value) > TOL]
+            ftxt = ws.cell(ft, cm).value
+            if not huerf or not es_formula(ftxt):
+                continue
+            letra = get_column_letter(cm)
+            nueva = re.sub(rf'(\$?{letra}\$?){ini}(\s*:)', lambda m_: f"{m_.group(1)}{ft + 1}{m_.group(2)}", ftxt, count=1)
+            if nueva != ftxt:
+                ws.cell(ft, cm).value = nueva
+                reporte.setdefault('advertencias', []).append(
+                    f"{nombre}!{ws.cell(ft, cm).coordinate}: la suma empezaba en la fila {ini} y dejaba por fuera la(s) fila(s) "
+                    f"{', '.join(map(str, huerf))} que este mes tienen valor; se amplió a {nueva}.")
 
         # 4) terceros nuevos por bloque → insertar filas dentro del bloque (en orden alfabético)
         nits_hoja = set()
