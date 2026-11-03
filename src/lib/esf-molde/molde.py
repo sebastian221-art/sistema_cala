@@ -1707,7 +1707,10 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                     if c_ and c_['tipo'] == 'CADENA' and nit_ and terceros_balance.get(nit_):
                         f_ = ws.cell(r, col).value
                         letra_prev_ = get_column_letter(col + 1 if p['orden'] == 'reciente_izquierda' else col - 1)
-                        if es_formula(f_) and re.fullmatch(r'=\+?\$?' + letra_prev_ + r'\$?' + str(r), f_.replace(' ', ''), re.I):
+                        if es_formula(f_) and re.fullmatch(r'=\+?\$?' + letra_prev_ + r'\$?' + str(r) + r'([+\-]\d+(\.\d+)?)*', f_.replace(' ', ''), re.I):
+                            if f_.replace(' ', '').lstrip('=+').upper() != f'{letra_prev_}{r}'.upper():
+                                reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': c_['etiqueta'], 'valor': f_,
+                                                           'motivo': "el mes anterior tenía un ajuste a mano; el tercero está en el balance, así que desde ahora toma su saldo"})
                             tb_ = terceros_balance[nit_]
                             celdas[r] = {'tipo': 'BALANCE', 'etiqueta': c_['etiqueta'], 'origen': 'cadena',
                                          'valor_base': vals.get(ws.title, r, col),
@@ -1892,7 +1895,17 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                             if pref_ not in src_h:
                                 continue
                             resto_ = src_h[pref_] - sum(src_h.get(cc, 0.0) for cc in excl)
-                            if abs(resto_) > TOL and abs(abs(resto_) - abs(v_)) <= TOL:
+                            exacto_ = abs(abs(resto_) - abs(v_)) <= TOL
+                            # único renglón a mano de la sección (los demás salen del balance) y casi igual al
+                            # resto de la cuenta (ej. 'T.C. Bancolombia' = 2105 − crédito): es ese resto
+                            valorados = [h2 for h2 in hs if h2 != hh and es_numero(vals.get(ws.title, h2, col)) and abs(vals.get(ws.title, h2, col)) > TOL]
+                            unico_ = valorados and all(celdas.get(h2, {}).get('tipo') == 'BALANCE' for h2 in valorados)
+                            cerca_ = unico_ and abs(resto_) > TOL and abs(abs(resto_) - abs(v_)) <= 0.05 * abs(v_)
+                            if abs(resto_) > TOL and (exacto_ or cerca_):
+                                if not exacto_:
+                                    reporte['dudosos'].append({'hoja': ws.title, 'fila': hh, 'etiqueta': c_['etiqueta'], 'valor': v_,
+                                                               'motivo': f"difiere {abs(abs(resto_) - abs(v_)):,.0f} de lo que queda de {pref_} "
+                                                                         f"después de sus hermanos ({abs(resto_):,.0f}); desde ahora toma ese valor del balance"})
                                 sg_ = 1 if (resto_ >= 0) == (v_ >= 0) else -1
                                 celdas[hh] = {'tipo': 'BALANCE', 'etiqueta': c_['etiqueta'], 'valor_base': v_,
                                               'regla': {'tipo': 'resto_cuentas', 'codigo': pref_, 'excluir': excl,
@@ -2137,6 +2150,14 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
         if any(norm(x) == norm(ws.title) for x in reglas.get('sin_terceros', [])):
             bloques_out = []   # la contadora no quiere filas de terceros en esta hoja
 
+        # terceros que tenía cada cuenta este mes: si el mes siguiente la cuenta queda en 0 y el mismo
+        # tercero aparece en otra subcuenta hermana (ej. Cámara de Comercio: 514020 → 514010), se le sigue
+        for c_ in celdas.values():
+            if c_.get('tipo') == 'BALANCE' and c_['regla'].get('tipo') == 'cuenta':
+                cf_ = c_['regla'].get('campo', 'sf')
+                nb_ = [n_ for n_, t_ in bal.terceros_bajo(c_['regla']['codigo']).items() if abs(t_[cf_]) > TOL]
+                if 1 <= len(nb_) <= 3:
+                    c_['regla']['nits_base'] = nb_
         molde['hojas'][ws.title] = {
             'col_actual': col, 'fila_mes': p['fila_mes'], 'fila_anio': p['fila_anio'], 'col_anio': p['col_anio'],
             'orden': p['orden'], 'anio': p['anio'], 'mes': p['mes'], 'formato_mes': p['formato_mes'],
@@ -2545,6 +2566,29 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             elif tipo == 'BALANCE':
                 val, ok = bal.valor(c['regla'])
                 val = round(val, 2) if ok else 0
+                rg_c = c['regla']
+                if rg_c.get('tipo') == 'cuenta' and rg_c.get('nits_base') and abs(val) <= TOL:
+                    # la cuenta quedó en 0: ¿su(s) tercero(s) se contabilizaron en una subcuenta hermana libre?
+                    cod_ = rg_c['codigo']
+                    usados_c = set()
+                    for x in h['celdas'].values():
+                        if x.get('tipo') == 'BALANCE':
+                            usados_c.update([x['regla']['codigo']] if 'codigo' in x['regla'] else x['regla'].get('codigos', []))
+                    cf_ = rg_c.get('campo', 'sf')
+                    nuevos_c = {}
+                    for cc, d_ in bal.terceros.items():
+                        if not cc.startswith(cod_[:4]) or cc.startswith(cod_) or any(cc.startswith(u) or u.startswith(cc) for u in usados_c):
+                            continue
+                        for n_ in rg_c['nits_base']:
+                            if n_ in d_ and abs(d_[n_][cf_]) > TOL:
+                                nuevos_c[cc] = nuevos_c.get(cc, 0.0) + d_[n_][cf_]
+                    if nuevos_c:
+                        reporte.setdefault('_seguidos', set()).update(nuevos_c)
+                        val = round(rg_c.get('signo', 1) * sum(nuevos_c.values()), 2)
+                        ok = True
+                        reporte.setdefault('advertencias', []).append(
+                            f"{nombre}!{dst.coordinate} ('{c['etiqueta']}'): la cuenta {cod_} quedó en 0 este mes y su tercero se "
+                            f"contabilizó en {', '.join(sorted(nuevos_c))}; se tomó de ahí ({val:,.0f}).")
                 if c['regla']['tipo'] == 'tercero' and (not ok or abs(val) <= 0.004):
                     # tercero sin saldo este mes: la celda queda vacía, como lo hace la contadora
                     dst.value = None
@@ -2972,7 +3016,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
             for c in molde['hojas'][n]['celdas'].values():
                 if c.get('por_nombre') and c['tipo'] == 'CADENA' and es_numero(c.get('valor_ant')):
                     valores_cadena.add(int(round(abs(c['valor_ant']))))
-        cub_total = set()        # cuentas cubiertas completas (renglón de cuenta/suma o bloque de terceros)
+        cub_total = set(reporte.pop('_seguidos', set()))   # cuentas cubiertas completas (renglón de cuenta/suma o bloque de terceros)
         cub_ter = set()          # (auxiliar, nit) cubiertos por un renglón de tercero suelto
         for n in hojas_eri:
             for c in molde['hojas'][n]['celdas'].values():
@@ -3122,6 +3166,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 f"{nombre}: {cambios} suma(s) acumulada(s) separadas por año (el acumulado del año nuevo arranca en {NOMBRE_MES[nuevo_mes].lower()}; "
                 f"el del año anterior queda solo con sus meses)")
 
+    reporte.pop('_seguidos', None)
     molde['periodo_base'] = {'anio': nuevo_anio, 'mes': nuevo_mes}
     molde['con_valor'] = cuentas_con_valor(bal)
     wb.save(salida_path)
