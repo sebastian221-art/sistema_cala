@@ -2150,6 +2150,29 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
         if any(norm(x) == norm(ws.title) for x in reglas.get('sin_terceros', [])):
             bloques_out = []   # la contadora no quiere filas de terceros en esta hoja
 
+        # 'Resultado del ejercicio' del balance general armado a mano (mes anterior + ERI del mes): el
+        # balance ya trae el acumulado del año (clases 4 a 7). Si su valor es casi el del balance, se toma
+        # del balance para que el ESF cuadre (los errores de meses viejos no se arrastran).
+        if not es_eri and any(k in bal.sf for k in ('4', '5')):
+            ytd_ = -sum(bal.sf.get(k, 0.0) for k in ('4', '5', '6', '7'))
+            for r_, c_ in list(celdas.items()):
+                et_ = norm(c_.get('etiqueta') or '')
+                if c_.get('tipo') not in ('CADENA', 'FORMULA') or not RE_EJERCICIO.search(et_) or RE_ANTERIORES.search(et_):
+                    continue
+                v_ = vals.get(ws.title, r_, col)
+                if not es_numero(v_) or abs(ytd_) <= TOL or (v_ >= 0) != (ytd_ >= 0):
+                    continue
+                dif_ = abs(v_ - ytd_)
+                if dif_ > 0.05 * abs(ytd_):
+                    continue
+                celdas[r_] = {'tipo': 'BALANCE', 'etiqueta': c_.get('etiqueta'), 'valor_base': v_, 'origen': 'resultado_anio',
+                              'regla': {'tipo': 'suma', 'codigos': ['4', '5', '6', '7'], 'campo': 'sf', 'signo': -1}}
+                cont[c_['tipo']] -= 1
+                cont['BALANCE'] += 1
+                if dif_ > TOL:
+                    reporte['dudosos'].append({'hoja': ws.title, 'fila': r_, 'etiqueta': c_.get('etiqueta'), 'valor': v_,
+                                               'motivo': f"tu resultado del ejercicio ({v_:,.0f}) difiere {dif_:,.0f} del acumulado del año en el "
+                                                         f"balance ({ytd_:,.0f}), por diferencias de meses anteriores; desde ahora se toma del balance"})
         # terceros que tenía cada cuenta este mes: si el mes siguiente la cuenta queda en 0 y el mismo
         # tercero aparece en otra subcuenta hermana (ej. Cámara de Comercio: 514020 → 514010), se le sigue
         for c_ in celdas.values():
