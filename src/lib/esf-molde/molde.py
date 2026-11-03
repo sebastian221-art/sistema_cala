@@ -310,9 +310,14 @@ def cuenta_cercana_por_nombre(bal, v, etiqueta, clases, es_eri, usados):
         if cod[:1] not in clases or len(cod) < 4 or abs(x) < TOL:
             continue
         dif = abs(abs(x) - abs(v))
-        if dif > tol:
-            continue
         nom = bal.nombre.get(cod, '')
+        if dif > tol:
+            # nombre IDÉNTICO a la cuenta ('CAJA' = Caja, 'Combustibles y lubricantes' = 519535): la
+            # contadora ajustó a mano el valor del mes base, pero el renglón es esa cuenta
+            ne, nn = norm(etiqueta).strip(' .:'), norm(nom).strip(' .:')
+            mismo = ne == nn or (len(ne) >= 4 and nn.startswith(ne + ' ') and nn.split()[-1] in ('general', 'generales'))
+            if not (mismo and (x >= 0) == (v >= 0) and dif <= abs(v) * (0.5 if es_eri else 0.15)):
+                continue
         sc = similitud_cuenta(etiqueta, nom)
         cont_, n_ = contenido_nombre(etiqueta, nom)
         if sc < 0.75 and not (cont_ >= 1.0 and n_ >= 1):
@@ -345,6 +350,33 @@ def enlace_de_fila(ws, r, col):
             if m and m.group(1) != ws.title:
                 vistos[m.group(1)] += 1
     return vistos.most_common(1)[0][0] if vistos else None
+
+
+def tercero_cercano_por_nombre(bal, v, etiqueta, es_eri):
+    """Tercero con el MISMO nombre del renglón y saldo casi igual (diferencias de pesos)."""
+    if not etiqueta or not es_numero(v) or abs(v) < 1000:
+        return None
+    campo = 'mov' if es_eri else 'sf'
+    tol = min(max(10.0, abs(v) * 0.001), 50000.0)
+    mejor = None
+    for cod, d in bal.terceros.items():
+        for nit, t in d.items():
+            x = t[campo]
+            dif = abs(abs(x) - abs(v))
+            if dif > tol or abs(x) < TOL:
+                continue
+            sc = similitud(etiqueta, t['nombre'])
+            if sc < 0.8:
+                continue
+            clave = (-sc, dif)
+            if mejor is None or clave < mejor[0]:
+                mejor = (clave, cod, nit, t, dif)
+    if not mejor:
+        return None
+    _, cod, nit, t, dif = mejor
+    return ({'tipo': 'tercero', 'codigos': [cod], 'nit': nit, 'campo': campo,
+             'signo': 1 if (t[campo] >= 0) == (v >= 0) else -1, 'nombre': t['nombre'],
+             'score': round(similitud(etiqueta, t['nombre']), 2)}, dif)
 
 
 def cuentas_con_valor(bal):
@@ -412,7 +444,12 @@ def similitud(a, b):
     tb = set(t for t in norm(b).replace('.', ' ').split() if len(t) > 1 and t not in _fuera)
     if not ta or not tb:
         return 0.0
-    base = len(ta & tb) / max(len(ta), len(tb))
+    import difflib
+
+    def _eq(x, y):      # 'discovery' ~ 'discover', 'munutencion' ~ 'manutencion'
+        return x == y or (len(x) >= 5 and len(y) >= 5 and x[0] == y[0] and difflib.SequenceMatcher(None, x, y).ratio() >= 0.85)
+    comunes = sum(1 for x in ta if any(_eq(x, y) for y in tb))
+    base = min(comunes, len(tb)) / max(len(ta), len(tb))
     # 'Zoom Producciones SAS' vs 'ZOOMPRODUCCIONES LTDA': mismo nombre pegado / sin la razón social
     ca, cb = ''.join(sorted(ta, key=lambda x: norm(a).find(x))), ''.join(sorted(tb, key=lambda x: norm(b).find(x)))
     def _suf(x):
@@ -420,6 +457,14 @@ def similitud(a, b):
         t = re.sub(r'\bs\s*a\s*s\b', 'sas', t)
         return {w for w in t.split() if w in ('sas', 'ltda', 'sa', 'eu', 'sca', 'cia')}
     extra = 0.05 if _suf(a) and _suf(a) == _suf(b) else 0.0     # desempate: misma razón social (LTDA vs SAS)
+    # nombre corto contenido en el largo ('El Nogal' ⊂ 'El Nogal Materiales de Construccion'),
+    # siempre que no sean palabras genéricas ('Otros', 'Clientes', 'Colombia'...)
+    _gen = {'otros', 'otro', 'varios', 'general', 'generales', 'cliente', 'clientes', 'proveedor', 'proveedores',
+            'nacional', 'nacionales', 'colombia', 'colombiana', 'compania', 'empresa', 'servicios', 'sociedad',
+            'grupo', 'banco', 'cia', 'and', 'cuenta', 'cuentas'}
+    corto, largo = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if corto and all(any(_eq(x, y) for y in largo) for x in corto) and any(len(t) >= 4 and t not in _gen for t in corto):
+        base = max(base, 0.7)
     if len(ca) >= 6 and len(cb) >= 6 and (ca == cb or ca in cb or cb in ca):
         return max(base, 0.9) + extra
     return base + (extra if base > 0 else 0.0)
@@ -1315,7 +1360,7 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                 regla_emb = None
                 clases_hoja_ = '4567' if es_eri else '123'
                 v_calc = vals.get(ws.title, r, col)
-                if sueltas and mira_anterior and not es_eri and es_numero(v_calc) and abs(v_calc) > TOL:
+                if sueltas and (mira_anterior or not refs) and not es_eri and es_numero(v_calc) and abs(v_calc) > TOL:
                     # 'mes anterior + lo del mes' cuyo resultado ES el saldo de una cuenta del balance:
                     # la contadora acumula a mano lo que el balance ya trae acumulado → se toma el saldo
                     cs_ = [x for x in bal.buscar_valor(v_calc) if x['campo'] == 'sf' and x['codigo'][:1] in clases_hoja_]
@@ -1389,6 +1434,16 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                         regla['score'] = round(tcs[0]['score'], 2)
             if regla is None:
                 tc = bal.buscar_tercero(v, etiqueta, preferir_mov=es_eri)
+                if not tc or tc[0]['score'] < 0.5:
+                    # ¿el tercero con ESE nombre tiene un saldo casi igual? (ej. 'Isem' 2.836.466 vs 2.836.469,
+                    # cuando otro tercero cualquiera da 2.836.467 exacto)
+                    tcn = tercero_cercano_por_nombre(bal, v, etiqueta, es_eri)
+                    if tcn:
+                        regla = tcn[0]
+                        if tcn[1] > TOL:
+                            reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': etiqueta, 'valor': v,
+                                                       'motivo': f"difiere {tcn[1]:,.2f} del saldo del tercero {regla['nombre']} (NIT {regla['nit']}); se vinculó por nombre"})
+                        tc = None
                 if tc:
                     if len(tc) == 1 or tc[0]['score'] >= 0.5:
                         regla = {k: tc[0][k] for k in ('tipo', 'codigos', 'nit', 'campo', 'signo')}
@@ -1673,6 +1728,23 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                     continue
                 nit_ = nomina.get(str(r), {}).get('nit')
                 tb_ = terceros_balance.get(nit_) if nit_ else None
+                vb_ = c_.get('valor_base')
+                # ¿el valor es de ESE tercero, pero en la cuenta que cruzó? (ej. 'Vega Rodriguez' 286.000 = su
+                # anticipo en 28050501, dentro de un bloque de clientes 1305): se toma el tercero en esa cuenta
+                propio_ = None
+                if es_numero(vb_):
+                    for t_ in bal.buscar_tercero(vb_, c_['etiqueta'], preferir_mov=es_eri):
+                        if any(str(cc).startswith(str(k)) for cc in t_['codigos'] for k in cods_) and \
+                                (t_['nit'] == nit_ or t_['score'] >= 0.8):
+                            propio_ = t_
+                            break
+                if propio_:
+                    celdas[r] = {'tipo': 'BALANCE', 'etiqueta': c_['etiqueta'], 'valor_base': vb_,
+                                 'regla': dict({k: propio_[k] for k in ('tipo', 'codigos', 'nit', 'campo', 'signo')}, nombre=propio_['nombre'])}
+                    nomina.setdefault(str(r), {'etiqueta': c_['etiqueta'], 'nit': None})['nit'] = None   # no es tercero del bloque
+                    reporte['dudosos'].append({'hoja': ws.title, 'fila': r, 'etiqueta': c_['etiqueta'], 'valor': vb_,
+                                               'motivo': f"es el tercero {propio_['nombre']} en {propio_['codigos'][0]} (otra cuenta que la del bloque); se respeta"})
+                    continue
                 if tb_:
                     celdas[r] = {'tipo': 'BALANCE', 'etiqueta': c_['etiqueta'], 'valor_base': c_.get('valor_base'),
                                  'regla': {'tipo': 'tercero', 'codigos': tb_['codigos'], 'nit': nit_,
@@ -1699,6 +1771,12 @@ def aprender(esf_path, balance_path, molde_out, reglas_path=None):
                 if any(any(cc.startswith(pf) for pf in prefijos_b) for cc in rg['codigos']):
                     continue
                 tb = terceros_balance.get(rg['nit'])
+                vb_ = celdas[r].get('valor_base')
+                if tb and rg.get('score', 0) >= 0.8 and es_numero(vb_) and \
+                        abs(abs(tb['mov' if es_eri else 'sf']) - abs(vb_)) > TOL:
+                    # el MISMO tercero, en otra cuenta que sí trae ese valor (ej. anticipo de Vega en 2805
+                    # dentro de un bloque de 1305): la contadora lo puso aquí a propósito → se respeta
+                    continue
                 if tb:
                     cods_ok = [cc for cc in tb['codigos'] if sub_comun and cc.startswith(sub_comun)] or tb['codigos']
                     rg['codigos'] = cods_ok
@@ -2776,6 +2854,8 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 continue
             if not b.get('puro', True) or repartida:
                 for nit, t in nuevos:
+                    if any(x['nit'] == nit and x['hoja'] == nombre for x in terceros_sin_fila):
+                        continue
                     terceros_sin_fila.append({'hoja': nombre, 'nit': nit, 'nombre': proper(t['nombre']), 'valor': round(t[cf], 2),
                                               'cuenta': ','.join(sorted({c[:6] for c in t['codigos']})),
                                               'motivo': 'la cuenta está repartida en varios bloques; decide en cuál va' if repartida else 'el bloque ya tiene un renglón a nivel de cuenta que lo incluye'})
