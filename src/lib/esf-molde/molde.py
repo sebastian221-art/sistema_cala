@@ -36,6 +36,7 @@ from itertools import combinations
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.formula.tokenizer import Tokenizer, Token
+from openpyxl.formula.translate import Translator
 
 # ─────────────────────────────────────────────────────────────────────────
 # Constantes
@@ -422,6 +423,137 @@ def cuentas_con_valor(bal):
     aunque su cuenta SÍ tenía valor, la contadora lleva ese valor en otro lado: no se llena solo."""
     return {'mov': sorted(c for c, v in bal.mov.items() if len(c) in (4, 6) and abs(v) > TOL),
             'sf': sorted(c for c, v in bal.sf.items() if len(c) in (4, 6) and abs(v) > TOL)}
+
+
+def formula_del_renglon(f, fila):
+    """True si la fórmula solo usa celdas de su propio renglón (ej. ACUMULADO =SUM(D41:M41))."""
+    if not es_formula(f) or '!' in f:
+        return False
+    try:
+        toks = Tokenizer(f).items
+    except Exception:
+        return False
+    hay = False
+    for t in toks:
+        if t.type == Token.OPERAND and t.subtype == Token.NUMBER:
+            return False                                # '=6300000-Z91': un número a mano de ese renglón, no se copia
+        if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+            for parte in t.value.replace('$', '').split(':'):
+                m = REF_RE.match(parte)
+                if not m or int(m.group(4)) != fila:
+                    return False
+                hay = True
+    return hay
+
+
+def copiar_formulas_de_renglon(ws, fila, refs, col_mes):
+    """Renglón nuevo (tercero insertado): copia de un renglón vecino las fórmulas que solo usan su propia fila
+    (ej. la columna ACUMULADO =SUM(D41:M41)), para que el acumulado incluya al tercero nuevo."""
+    for ref in refs:
+        if ref < 1 or ref == fila:
+            continue
+        hechas = 0
+        for cc in range(1, min(ws.max_column, 80) + 1):
+            if cc == col_mes or ws.cell(fila, cc).value is not None:
+                continue
+            f = ws.cell(ref, cc).value
+            if formula_del_renglon(f, ref):
+                try:
+                    ws.cell(fila, cc).value = Translator(f, origin=ws.cell(ref, cc).coordinate).translate_formula(
+                        ws.cell(fila, cc).coordinate)
+                    hechas += 1
+                except Exception:
+                    pass
+        if hechas:
+            return
+
+
+RE_SUM_FILA = re.compile(r'^=\s*\+?\s*SUM\(\s*\$?([A-Z]{1,3})\$?(\d+)\s*:\s*\$?([A-Z]{1,3})\$?(\d+)\s*\)\s*$', re.I)
+
+
+def completar_acumulados_cortos(ws, col_mes):
+    """Columna ACUMULADO donde casi todos los renglones dicen =SUM(D41:M41) (desde el mes nuevo hasta enero) pero
+    algunos quedaron cortos (=SUM(F1390:M1390), sin los últimos meses): se completan como los demás."""
+    if not col_mes:
+        return []
+    from collections import Counter, defaultdict
+    por_col = defaultdict(list)
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if not isinstance(v, str) or not v.startswith('='):
+                continue
+            m = RE_SUM_FILA.match(v)
+            if not m or int(m.group(2)) != cell.row or int(m.group(4)) != cell.row:
+                continue
+            a, b = column_index_from_string(m.group(1).upper()), column_index_from_string(m.group(3).upper())
+            if a <= cell.column <= b:
+                continue
+            por_col[cell.column].append((cell.row, a, b))
+    out = []
+    for col, filas in por_col.items():
+        if len(filas) < 5:
+            continue
+        (a0, b0), n0 = Counter((a, b) for _, a, b in filas).most_common(1)[0]
+        if a0 != col_mes or n0 < 0.6 * len(filas):
+            continue
+        con_f = {r for r, _, _ in filas}
+        for r in range(1, ws.max_row + 1):
+            # renglón de tercero sin acumulado, entre renglones que sí lo tienen
+            if r in con_f or ws.cell(r, col).value is not None or not (r - 1 in con_f or r + 1 in con_f):
+                continue
+            if any(isinstance(ws.cell(r, c).value, (int, float)) and abs(ws.cell(r, c).value) > TOL for c in range(a0, b0 + 1)) \
+                    and not any(es_formula(ws.cell(r, c).value) for c in range(a0, b0 + 1)):
+                ws.cell(r, col).value = f"=SUM({get_column_letter(a0)}{r}:{get_column_letter(b0)}{r})"
+                copiar_estilo(ws.cell(r - 1 if r - 1 in con_f else r + 1, col), ws.cell(r, col))
+                out.append(f"{ws.cell(r, col).coordinate}: el renglón no tenía acumulado; ahora {ws.cell(r, col).value}")
+        for r, a, b in filas:
+            if b == b0 and a0 < a <= b0:
+                viejo = ws.cell(r, col).value
+                ws.cell(r, col).value = f"=SUM({get_column_letter(a0)}{r}:{get_column_letter(b0)}{r})"
+                out.append(f"{ws.cell(r, col).coordinate}: el acumulado no sumaba los últimos meses ({viejo}); ahora {ws.cell(r, col).value}")
+    return out
+
+
+RE_MILES = re.compile(r'miles\s+de\s+pesos', re.I)
+FMT_MILES = '#,##0,'
+
+
+def aplicar_formato_miles(wb, hojas):
+    """Si el informe dice 'cifras expresadas en miles de pesos', todas las cifras de las hojas del molde se muestran
+    en miles (formato '#,##0,': el valor de la celda no cambia, solo cómo se ve). Devuelve cuántas celdas cambió."""
+    dice_miles = any(isinstance(wb[n].cell(r, c).value, str) and RE_MILES.search(wb[n].cell(r, c).value)
+                     for n in hojas for r in range(1, 11) for c in range(1, 12))
+    if not dice_miles:
+        return 0
+    cambiadas = 0
+    for n in hojas:
+        if re.search(r'INDIC|GRAFIC', n, re.I):           # razones, días, porcentajes: no son pesos
+            continue
+        ws = wb[n]
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                fm = cell.number_format or 'General'
+                if v is None or isinstance(v, bool):
+                    continue
+                if not (es_formula(v) or isinstance(v, (int, float))):
+                    continue
+                if isinstance(v, (int, float)) and abs(v) < 1000:   # números de nota, ceros, años chicos
+                    continue
+                if isinstance(v, (int, float)) and float(v).is_integer() and 1900 <= v <= 2100 and cell.row <= 12:
+                    continue                                    # año del encabezado
+                f_ = fm.split(';')[0]
+                if f_.rstrip().endswith(',') or re.search(r',[_)"\s]', f_.replace('#,#', '')):
+                    continue                                    # ya está en miles
+                f_l = re.sub(r'"[^"]*"|\[[^\]]*\]|_.|\\.', '', f_).lower()
+                if fm != 'General' and any(x in f_l for x in ('%', '@', 'd', 'm', 'y', 'h', 's', 'e+')):
+                    continue
+                if fm != 'General' and '#,##' not in f_:
+                    continue                                    # '0', '0.00': índices, notas, razones
+                cell.number_format = FMT_MILES
+                cambiadas += 1
+    return cambiadas
 
 
 def padres_de_filas(ws, col, max_fila):
@@ -3198,6 +3330,7 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 if b.get('nit_col'):
                     ws.cell(rr, b['nit_col']).value = int(nit) if nit.isdigit() else nit
                 ws.cell(rr, cm).value = round(b.get('signo', 1) * t[cf], 2)
+                copiar_formulas_de_renglon(ws, rr, [ref_row, fila_ins + n], cm)
                 reporte['terceros_nuevos'].append({'hoja': nombre, 'celda': ws.cell(rr, cm).coordinate, 'nit': nit,
                                                    'nombre': proper(t['nombre']), 'valor': round(t[cf], 2),
                                                    'cuenta': ','.join(b['cuenta_padre']) if isinstance(b['cuenta_padre'], list) else b['cuenta_padre']})
@@ -3427,6 +3560,14 @@ def extender(esf_path, molde_path, balance_path, salida_path):
                 f"el del año anterior queda solo con sus meses)")
 
     reporte.pop('_seguidos', None)
+    for nombre_ in [n for n in molde['hojas'] if n in wb.sheetnames]:
+        for txt in completar_acumulados_cortos(wb[nombre_], plan[nombre_]['col_mes'] if nombre_ in plan and not plan[nombre_].get('cambia_anio') else None):
+            reporte.setdefault('acumulados', []).append(f"{nombre_}!{txt}")
+    n_miles = aplicar_formato_miles(wb, [n for n in molde['hojas'] if n in wb.sheetnames])
+    if n_miles:
+        reporte.setdefault('advertencias', []).append(
+            f"El informe dice 'cifras en miles de pesos': {n_miles} celda(s) que se veían en pesos ahora se ven en miles "
+            f"(solo cambia cómo se ve; el valor guardado sigue completo)")
     molde['periodo_base'] = {'anio': nuevo_anio, 'mes': nuevo_mes}
     molde['con_valor'] = cuentas_con_valor(bal)
     wb.save(salida_path)
